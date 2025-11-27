@@ -1,8 +1,8 @@
 {
   "manifest_version": 1,
   "name": "智能分段插件 (Smart Segmentation Plugin)",
-  "version": "1.0.0",
-  "description": "使用 LLM 智能切分回复文本，在语义自然的地方切分，保持原文内容不变，让回复更加灵活自然",
+  "version": "1.2.0",
+  "description": "使用 LLM 智能切分回复文本，在语义自然的地方切分，保持原文内容不变，让回复更加灵活自然。支持通过user_llm配置节直接使用自定义LLM服务。",
   "author": {
     "name": "久远",
     "url": "https://github.com/saberlights"
@@ -43,7 +43,8 @@
       "保持原文内容不变",
       "语义自然停顿",
       "可配置切分风格",
-      "使用小模型快速处理"
+      "系统内置模型支持",
+      "user_llm自定义模型支持"
     ],
     "dependencies": {
       "python": [],
@@ -60,13 +61,13 @@
     "llm.call"
   ],
   "changelog": {
-    "1.0.0": {
+    "1.2.0": {
       "date": "2025-11-27",
       "changes": [
-        "初始版本发布",
-        "实现智能文本分段功能",
-        "支持多种分段风格配置",
-        "集成 LLM 语义分析"
+        "添加user_llm配置节，支持直接配置自定义LLM服务",
+        "用户只需设置model_name = \"user_llm\"即可使用自定义模型",
+        "优化了一些代码"，
+        "添加log输出到命令行"
       ]
     }
   },
