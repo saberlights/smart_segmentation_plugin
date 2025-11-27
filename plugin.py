@@ -101,25 +101,31 @@ class SmartSegmentationHandler(BaseEventHandler):
 
         style = self.get_config("segmentation.style", "natural")
         style_guides = {
-            "natural": "在自然停顿的地方切分，一个完整想法作为一段。",
-            "conservative": "尽量少切分，只在明显话题转换处切分。",
-            "active": "切分更细致，在语气转换、情绪变化处也可切分。"
+            "natural": "在话题转换、语气变化等重要停顿处切分。一个完整的意思放在一段里，不要过度切分。",
+            "conservative": "尽量少切分，只在明显话题转换处切分。多个句子可以放在同一段。",
+            "active": "切分更细致，在语气转换、情绪变化处也可切分，但仍要保持语义完整。"
         }
 
         prompt = f"""将文本切分成多段，模拟真人发消息节奏。
 
 {style_guides.get(style, style_guides["natural"])}
 
-规则：
-- 在语义完整、自然停顿处切分
+重要规则：
+- 不要在每个标点都切分！只在重要的语义停顿处切分
+- 相关的句子应该保持在同一段
 - 最多切分成 {max_segments} 段
-- 删除切分点的逗号、句号、顿号
+- 切分时可以删除切分点的逗号、句号、顿号
 - 保留感叹号、问号、省略号、波浪号等情绪标点
-- 其他内容不变
+- 保持原文内容和语气不变
 
 原文：{original}
 
-返回 JSON 数组：["片段1", "片段2"]"""
+返回 JSON 数组：["片段1", "片段2"]
+
+示例：
+原文："今天天气不错，阳光明媚。我们去公园玩吧！"
+好的切分：["今天天气不错，阳光明媚", "我们去公园玩吧！"]
+不好的切分：["今天天气不错", "阳光明媚", "我们去公园玩吧！"]（过度切分）"""
 
         try:
             result, _ = await self.segmentation_llm.generate_response_async(prompt)
