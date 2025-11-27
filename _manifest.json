@@ -5,14 +5,14 @@
   "description": "使用 LLM 智能切分回复文本，在语义自然的地方切分，保持原文内容不变，让回复更加灵活自然",
   "author": {
     "name": "久远",
-    "url": "https://github.com/saberlights/smart_segmentation_plugin"
+    "url": "https://github.com/saberlights"
   },
   "license": "GPL-v3.0-or-later",
   "host_application": {
     "min_version": "0.11.0"
   },
-  "homepage_url": "https://github.com/MaiM-with-u/maibot",
-  "repository_url": "https://github.com/MaiM-with-u/maibot",
+  "homepage_url": "https://github.com/saberlights/smart_segmentation_plugin",
+  "repository_url": "https://github.com/saberlights/smart_segmentation_plugin",
   "keywords": [
     "segmentation",
     "text-processing",
