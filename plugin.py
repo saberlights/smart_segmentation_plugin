@@ -77,7 +77,7 @@ class SmartSegmentationHandler(BaseEventHandler):
         """延迟初始化 LLM"""
         if self.segmentation_llm is None:
             self.segmentation_llm = LLMRequest(
-                model_set=model_config.model_task_config.utils_small,
+                model_set=model_config.model_task_config.tool_use,
                 request_type="smart_segmentation"
             )
 
