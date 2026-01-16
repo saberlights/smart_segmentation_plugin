@@ -15,6 +15,7 @@ from src.plugin_system import (
 )
 from src.llm_models.utils_model import LLMRequest
 from src.config.config import model_config
+from src.config.api_ada_configs import TaskConfig
 from src.common.logger import get_logger
 
 logger = get_logger("smart_segmentation")
@@ -76,8 +77,15 @@ class SmartSegmentationHandler(BaseEventHandler):
     def _init_llm(self):
         """延迟初始化 LLM"""
         if self.segmentation_llm is None:
+            model_name = self.get_config("segmentation.model", "")
+            if model_name:
+                # 使用配置中指定的模型
+                task_config = TaskConfig(model_list=[model_name])
+            else:
+                # 默认使用 utils 任务配置
+                task_config = model_config.model_task_config.utils
             self.segmentation_llm = LLMRequest(
-                model_set=model_config.model_task_config.utils_small,
+                model_set=task_config,
                 request_type="smart_segmentation"
             )
 
@@ -176,6 +184,11 @@ class SmartSegmentationPlugin(BasePlugin):
         },
         "segmentation": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用智能分段"),
+            "model": ConfigField(
+                type=str,
+                default="",
+                description="使用的模型名称（需在model_config中配置），留空则使用utils任务配置"
+            ),
             "style": ConfigField(
                 type=str,
                 default="natural",
