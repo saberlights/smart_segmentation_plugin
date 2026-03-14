@@ -6,12 +6,15 @@ from typing import List, Tuple, Type
 
 from src.plugin_system import (
     BasePlugin,
+    BaseCommand,
     register_plugin,
     BaseEventHandler,
     EventType,
     MaiMessages,
     ConfigField,
     ComponentInfo,
+    CommandInfo,
+    send_api,
 )
 from src.llm_models.utils_model import LLMRequest
 from src.config.config import model_config
@@ -19,6 +22,9 @@ from src.config.api_ada_configs import TaskConfig
 from src.common.logger import get_logger
 
 logger = get_logger("smart_segmentation")
+
+# 运行时开关状态（独立于配置文件，用于命令动态控制）
+_runtime_enabled = True
 
 # ============================================================================
 # Monkey Patch
@@ -97,6 +103,9 @@ class SmartSegmentationHandler(BaseEventHandler):
         if not self.get_config("segmentation.enabled", True):
             return True, True, "未启用", None, message
 
+        if not _runtime_enabled:
+            return True, True, "已通过命令关闭", None, message
+
         original = message.llm_response_content
         min_length = self.get_config("segmentation.min_length", 20)
         max_segments = self.get_config("segmentation.max_segments", 8)
@@ -109,31 +118,35 @@ class SmartSegmentationHandler(BaseEventHandler):
 
         style = self.get_config("segmentation.style", "natural")
         style_guides = {
-            "natural": "在话题转换、语气变化等重要停顿处切分。一个完整的意思放在一段里，不要过度切分。",
-            "conservative": "尽量少切分，只在明显话题转换处切分。多个句子可以放在同一段。",
-            "active": "切分更细致，在语气转换、情绪变化处也可切分，但仍要保持语义完整。"
+            "natural": "像和朋友微信聊天一样自然地分条发送。有的消息短有的长，节奏随意。",
+            "conservative": "偏沉稳的发消息风格，一条消息说比较完整的内容，不会频繁发短消息。",
+            "active": "活泼的发消息风格，喜欢发短消息连击，反应词和正文分开发。"
         }
 
-        prompt = f"""将文本切分成多段，模拟真人发消息节奏。
+        prompt = f"""你正在模拟一个人用手机聊天。下面是 ta 想说的内容，请把它分成几条消息，就像真人会怎么一条一条发出来那样。
 
 {style_guides.get(style, style_guides["natural"])}
 
-重要规则：
-- 不要在每个标点都切分！只在重要的语义停顿处切分
-- 相关的句子应该保持在同一段
-- 最多切分成 {max_segments} 段
-- 切分时可以删除切分点的逗号、句号、顿号
-- 保留感叹号、问号、省略号、波浪号等情绪标点
-- 保持原文内容和语气不变
+规则：
+- 去掉每条消息末尾的句号「。」，真人聊天很少用句号结尾
+- 保留感叹号、问号、省略号、波浪号等有情绪的标点
+- 不要每个逗号都拆开，相关的内容放在一条里
+- 消息长短可以不均匀
+- 最多分成 {max_segments} 条
 
 原文：{original}
 
-返回 JSON 数组：["片段1", "片段2"]
+返回 JSON 数组，如 ["消息1", "消息2"]
 
 示例：
-原文："今天天气不错，阳光明媚。我们去公园玩吧！"
-好的切分：["今天天气不错，阳光明媚", "我们去公园玩吧！"]
-不好的切分：["今天天气不错", "阳光明媚", "我们去公园玩吧！"]（过度切分）"""
+原文："我今天去了那个新开的咖啡店，环境还不错。点了一杯拿铁，味道一般般吧，没有之前那家好喝。对了你上次推荐的那本书我看完了，超好看！"
+分条：["我今天去了那个新开的咖啡店，环境还不错", "点了一杯拿铁，味道一般般吧，没有之前那家好喝", "对了你上次推荐的那本书我看完了", "超好看！"]
+
+原文："哈哈真的吗，那太好了！我还以为你不喜欢呢。下次我们一起去看电影吧，最近有个新片子挺有意思的。"
+分条：["哈哈真的吗", "那太好了！我还以为你不喜欢呢", "下次我们一起去看电影吧，最近有个新片子挺有意思的"]
+
+原文："嗯...这个问题有点复杂，我想想怎么说。简单来说就是你需要先把环境配好，然后再安装依赖。如果还有问题可以再问我。"
+分条：["嗯...这个问题有点复杂", "我想想怎么说", "简单来说就是你需要先把环境配好，然后再安装依赖", "如果还有问题可以再问我"]"""
 
         try:
             result, _ = await self.segmentation_llm.generate_response_async(prompt)
@@ -156,6 +169,51 @@ class SmartSegmentationHandler(BaseEventHandler):
             logger.error(f"智能切分失败: {e}")
 
         return True, True, "完成", None, message
+
+# ============================================================================
+# Command
+# ============================================================================
+
+class SmartSegmentationCommand(BaseCommand):
+    """通过命令开关智能分段"""
+
+    command_name: str = "smart_seg"
+    command_description: str = "开关智能分段功能"
+    command_pattern: str = r"(?P<seg_cmd>^/smart_seg(\s+(on|off|status))?\s*$)"
+
+    async def execute(self) -> Tuple[bool, str, int]:
+        global _runtime_enabled
+
+        cmd_text = self.matched_groups.get("seg_cmd", "").strip()
+        parts = cmd_text.split()
+
+        if len(parts) == 1:
+            # 无参数，切换状态
+            _runtime_enabled = not _runtime_enabled
+            state = "开启" if _runtime_enabled else "关闭"
+            await self.send_text(f"智能分段已{state}")
+            logger.info(f"智能分段已通过命令切换为: {state}")
+            return True, f"智能分段已{state}", 2
+
+        action = parts[1]
+        if action == "on":
+            _runtime_enabled = True
+            await self.send_text("智能分段已开启")
+            logger.info("智能分段已通过命令开启")
+            return True, "智能分段已开启", 2
+        elif action == "off":
+            _runtime_enabled = False
+            await self.send_text("智能分段已关闭")
+            logger.info("智能分段已通过命令关闭")
+            return True, "智能分段已关闭", 2
+        elif action == "status":
+            state = "开启" if _runtime_enabled else "关闭"
+            await self.send_text(f"智能分段当前状态: {state}")
+            return True, f"状态: {state}", 2
+
+        await self.send_text("用法: /smart_seg [on|off|status]")
+        return False, "参数错误", 2
+
 
 # ============================================================================
 # Plugin Registration
@@ -202,4 +260,5 @@ class SmartSegmentationPlugin(BasePlugin):
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
         return [
             (SmartSegmentationHandler.get_handler_info(), SmartSegmentationHandler),
+            (SmartSegmentationCommand.get_command_info(), SmartSegmentationCommand),
         ]
