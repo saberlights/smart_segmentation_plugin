@@ -2,6 +2,7 @@
 智能分段插件 - 使用 LLM 智能切分回复文本
 """
 import json
+import re
 from typing import List, Tuple, Type
 
 from src.plugin_system import (
@@ -32,6 +33,16 @@ _runtime_enabled = True
 
 _original_process_llm_response = None
 _patch_applied = False
+
+
+def _strip_thinking_content(text: str) -> str:
+    """移除 thinking 标签及其内容，只保留最终可见正文。"""
+    if not text:
+        return ""
+
+    cleaned_text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_text = re.sub(r"</?thinking>", "", cleaned_text, flags=re.IGNORECASE)
+    return cleaned_text.strip()
 
 def patched_process_llm_response(text: str, enable_splitter: bool = True, enable_chinese_typo: bool = True) -> list[str]:
     """识别智能分段分隔符并切分，否则使用原函数"""
@@ -107,11 +118,21 @@ class SmartSegmentationHandler(BaseEventHandler):
             return True, True, "已通过命令关闭", None, message
 
         original = message.llm_response_content
+        visible_text = _strip_thinking_content(original)
         min_length = self.get_config("segmentation.min_length", 20)
         max_segments = self.get_config("segmentation.max_segments", 8)
 
-        if len(original) < min_length:
-            logger.debug(f"文本太短({len(original)}字)")
+        if not visible_text:
+            logger.warning("智能分段检测到回复只包含 thinking，无可见正文，已跳过分段")
+            message.modify_llm_response_content("")
+            return True, True, "无可见正文", None, message
+
+        if visible_text != original:
+            logger.debug("智能分段前已剥离 thinking 内容")
+            message.modify_llm_response_content(visible_text)
+
+        if len(visible_text) < min_length:
+            logger.debug(f"文本太短({len(visible_text)}字)")
             return True, True, "文本太短", None, message
 
         self._init_llm()
@@ -134,7 +155,7 @@ class SmartSegmentationHandler(BaseEventHandler):
 - 消息长短可以不均匀
 - 最多分成 {max_segments} 条
 
-原文：{original}
+原文：{visible_text}
 
 返回 JSON 数组，如 ["消息1", "消息2"]
 
