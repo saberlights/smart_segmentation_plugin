@@ -273,7 +273,7 @@ class SmartSegmentationPlugin(BasePlugin):
                 default="natural",
                 description="切分风格：natural(自然), conservative(保守), active(活跃)"
             ),
-            "min_length": ConfigField(type=int, default=20, description="启用分段的最小文本长度"),
+            "min_length": ConfigField(type=int, default=15, description="启用分段的最小文本长度"),
             "max_segments": ConfigField(type=int, default=8, description="最大切分段数"),
         }
     }

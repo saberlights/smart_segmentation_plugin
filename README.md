@@ -34,13 +34,13 @@ enabled = true
 [segmentation]
 enabled = true
 style = "natural"    # 切分风格
-min_length = 20      # 最小切分长度
+min_length = 15      # 最小切分长度
 max_segments = 8     # 最大段数
 ```
 
 ### 3. 配置模型
 
-在 `config/model_config.toml` 中配置模型。插件默认使用 `utils` 任务配置的模型，也可以在插件配置中指定：
+在 `config/model_config.toml` 中配置模型。插件注册默认使用 `utils` 任务配置；如果你在插件配置文件里显式填写 `model`，则优先使用该值：
 
 ```toml
 [segmentation]
@@ -59,7 +59,7 @@ model = "gpt-4o-mini"  # 留空则使用 utils 任务配置
 
 ### 最小长度 (min_length)
 
-小于此长度的文本不会切分，默认 20 字符。
+小于此长度的文本不会切分，默认 15 字符。
 
 ### 最大段数 (max_segments)
 
