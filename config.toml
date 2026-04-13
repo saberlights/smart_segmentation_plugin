@@ -12,6 +12,9 @@
 # 插件名称
 name = "smart_segmentation_plugin"
 
+# 配置文件版本
+config_version = "1.0.0"
+
 # 插件版本
 version = "1.0.0"
 
@@ -19,10 +22,17 @@ version = "1.0.0"
 enabled = true
 
 # 智能分段配置
+
 [segmentation]
 
 # 是否启用智能分段
 enabled = true
+
+# 使用的模型名称。可填写 task 名（如 utils），也可直接填写
+# 宿主 model_config.toml 里的具体模型名（[[models]].name）
+# 或模型标识（[[models]].model_identifier）
+# 留空时插件会优先回退到 utils
+model = "doubao1.6"
 
 # 切分风格
 # - natural: 自然风格，在自然停顿处切分（推荐）
@@ -32,7 +42,7 @@ style = "natural"
 
 # 启用分段的最小文本长度（字符数）
 # 小于此长度的文本不会切分
-min_length = 20
+min_length = 15
 
 # 最大切分段数
 # 避免长文切分过多导致刷屏
