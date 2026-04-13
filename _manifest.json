@@ -1,74 +1,38 @@
 {
-  "manifest_version": 1,
-  "name": "智能分段插件 (Smart Segmentation Plugin)",
+  "manifest_version": 2,
   "version": "1.0.0",
-  "description": "使用 LLM 智能切分回复文本，在语义自然的地方切分，保持原文内容不变，让回复更加灵活自然",
+  "name": "智能分段插件 (Smart Segmentation Plugin)",
+  "description": "使用 LLM 智能切分回复文本，在语义自然的地方切分，保持原文内容不变，让回复更加灵活自然。",
   "author": {
     "name": "久远",
     "url": "https://github.com/saberlights"
   },
   "license": "GPL-v3.0-or-later",
-  "homepage_url": "https://github.com/saberlights/smart_segmentation_plugin",
-  "repository_url": "https://github.com/saberlights/smart_segmentation_plugin",
+  "urls": {
+    "repository": "https://github.com/saberlights/smart_segmentation_plugin",
+    "homepage": "https://github.com/saberlights/smart_segmentation_plugin",
+    "documentation": "https://github.com/saberlights/smart_segmentation_plugin",
+    "issues": "https://github.com/saberlights/smart_segmentation_plugin/issues"
+  },
   "host_application": {
-    "name": "MaiBot",
-    "min_version": "0.11.0"
+    "min_version": "0.11.0",
+    "max_version": "1.0.0"
   },
-  "keywords": [
-    "segmentation",
-    "text-processing",
-    "natural-language",
-    "smart-split",
-    "llm"
-  ],
-  "categories": [
-    "Text Processing",
-    "AI Enhancement"
-  ],
-  "default_locale": "zh-CN",
-  "plugin_info": {
-    "is_built_in": false,
-    "plugin_type": "enhancement",
-    "components": [
-      {
-        "type": "event_handler",
-        "name": "smart_segmentation_handler",
-        "description": "使用LLM智能切分回复文本",
-        "event_type": "after_llm",
-        "intercept_message": true
-      }
-    ],
-    "features": [
-      "智能文本切分",
-      "保持原文内容不变",
-      "语义自然停顿",
-      "可配置切分风格",
-      "使用小模型快速处理"
-    ],
-    "dependencies": {
-      "python": [],
-      "plugins": [],
-      "external_api": []
-    },
-    "config": {
-      "config_file": "config.toml",
-      "has_default_config": true
-    }
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
   },
-  "permissions": [
-    "message.intercept",
-    "llm.call"
+  "dependencies": [],
+  "capabilities": [
+    "config.get_all",
+    "send.text",
+    "llm.generate"
   ],
-  "changelog": {
-    "1.0.0": {
-      "date": "2025-11-27",
-      "changes": [
-        "初始版本发布",
-        "实现智能文本分段功能",
-        "支持多种分段风格配置",
-        "集成 LLM 语义分析"
-      ]
-    }
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
   },
-  "id": "saberlights.smart_segmentation_plugin"
+  "id": "saberlights.smart-segmentation-plugin"
 }

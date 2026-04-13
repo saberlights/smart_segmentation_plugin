@@ -29,6 +29,7 @@ enable = false  # 必须禁用内置分段，否则会冲突
 
 ```toml
 [plugin]
+config_version = "1.0.0"
 enabled = true
 
 [segmentation]
@@ -40,11 +41,11 @@ max_segments = 8     # 最大段数
 
 ### 3. 配置模型
 
-在 `config/model_config.toml` 中配置模型。插件注册默认使用 `utils` 任务配置；如果你在插件配置文件里显式填写 `model`，则优先使用该值：
+在宿主的模型配置中准备好可用模型后，插件配置里的 `model` 支持三种写法：task 名、`[[models]].name`，或 `[[models]].model_identifier`。当你填写具体模型时，插件会像 `nai_pic_plugin` 一样直接固定到该模型，不需要你再去改 `model_task_config`。留空时交给宿主默认模型处理。
 
 ```toml
 [segmentation]
-model = "gpt-4o-mini"  # 留空则使用 utils 任务配置
+model = "doubao1.6"  # 也可以写具体 model_identifier 或 utils
 ```
 
 推荐使用小模型（gpt-4o-mini、qwen-plus、deepseek 等），分段任务对模型能力要求不高。
@@ -113,12 +114,11 @@ model = "gpt-4o-mini"  # 留空则使用 utils 任务配置
 
 ## 🔧 工作原理
 
-1. **AFTER_LLM 阶段**：拦截 LLM 生成的文本
-2. **智能分析**：使用 LLM 模拟真人聊天节奏，决定分条方式
-3. **标点处理**：去掉末尾句号，保留情绪标点
-4. **添加分隔符**：用 `|||SPLIT|||` 标记切分点
-5. **Monkey Patch**：替换 `process_llm_response()` 识别分隔符并切分
-6. **分批发送**：每个片段作为独立消息发送
+1. **AFTER_LLM 预处理**：在 `AFTER_LLM` 阶段先把主回复切成多段，并写入内部标记
+2. **发送前消费标记**：在 `send_service.after_build_message` 阶段读取标记后的文本
+3. **首段改写**：首条消息仍走原始发送链路，保留宿主发送上下文
+4. **发送后补发**：在 `send_service.after_send` 成功后补发剩余段落
+5. **重入保护**：插件自行补发的消息不会再次被智能分段
 
 ## ⚠️ 注意事项
 
@@ -132,7 +132,7 @@ model = "gpt-4o-mini"  # 留空则使用 utils 任务配置
 
 1. 检查 `config.toml` 中 `enabled = true`
 2. 确认已禁用内置 `response_splitter`（在 `config/bot_config.toml` 中）
-3. 查看日志是否有 `✅ 已 patch process_llm_response` 信息
+3. 查看日志是否有“智能分段预切分完成”或“智能分段已消费预分段标记”相关日志
 
 ### 切分效果不理想
 
