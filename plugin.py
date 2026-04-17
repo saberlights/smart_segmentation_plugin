@@ -393,9 +393,34 @@ def _get_outbound_additional_config(message: dict[str, Any]) -> dict[str, Any]:
     return additional_config
 
 
-def _should_apply_after_build_fallback(message: dict[str, Any]) -> bool:
-    """仅对看起来像主回复链的纯文本消息启用发送前兜底分段。"""
+def _is_plugin_command_feedback_text(text: str) -> bool:
+    """识别本插件自身发送的帮助/状态文本，避免被再次分段。"""
+    normalized_text = str(text or "").strip()
+    if not normalized_text:
+        return False
+
+    if normalized_text == "用法: /smart_seg [on|off|status]":
+        return True
+
+    if normalized_text in {"智能分段已开启", "智能分段已关闭"}:
+        return True
+
+    if normalized_text.startswith("智能分段当前状态: "):
+        return True
+
+    if normalized_text.startswith("智能分段已"):
+        return True
+
+    return False
+
+
+def _should_apply_after_build_fallback(message: dict[str, Any], *, storage_message: bool = True) -> bool:
+    """对大多数纯文本出站消息启用发送前兜底分段。"""
     additional_config = _get_outbound_additional_config(message)
+    outbound_text = _strip_thinking_content(_extract_plain_text_outbound_message(message))
+
+    if _is_plugin_command_feedback_text(outbound_text):
+        return False
 
     selected_expressions = additional_config.get("selected_expressions")
     if isinstance(selected_expressions, list) and selected_expressions:
@@ -410,7 +435,14 @@ def _should_apply_after_build_fallback(message: dict[str, Any]) -> bool:
         if marker_value:
             return True
 
-    return False
+    # 大量插件命令帮助/进度/报错文本会显式标记为不入库，
+    # 这类主动输出不应参与智能分段。
+    if not storage_message:
+        return False
+
+    # 宿主链路近期出现了 reply_to / replyer 标记缺失的情况，
+    # 这里回退到“只要是纯文本出站消息就尝试分段”，避免正常主回复被跳过。
+    return True
 
 
 def _normalize_pending_lookup_keys(*keys: Any) -> list[str]:
@@ -924,11 +956,20 @@ class SmartSegmentationPlugin(MaiBotPlugin):
 
         segments, marker_source = _extract_prepared_segments_from_outbound_message(message, display_message)
         if not segments or len(segments) <= 1:
-            if not _should_apply_after_build_fallback(message):
+            if not _should_apply_after_build_fallback(
+                message,
+                storage_message=bool(updated_kwargs.get("storage_message", True)),
+            ):
+                logger.debug("智能分段跳过发送前兜底：当前消息不满足兜底条件")
                 return {"action": "continue"}
 
             outbound_text = _strip_thinking_content(_extract_plain_text_outbound_message(message, display_message))
             if not outbound_text or len(outbound_text) < settings["min_length"]:
+                logger.debug(
+                    "智能分段跳过发送前兜底：文本为空或长度不足，length=%s min_length=%s",
+                    len(outbound_text),
+                    settings["min_length"],
+                )
                 return {"action": "continue"}
 
             segments = await self._segment_text(
