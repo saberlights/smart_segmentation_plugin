@@ -63,6 +63,7 @@ logger = logging.getLogger("plugin.smart_segmentation")
 _runtime_enabled = True
 _pending_follow_up_segments: dict[str, dict[str, Any]] = {}
 _stream_resend_guards: dict[str, int] = {}
+_active_command_streams: dict[str, int] = {}
 _SEGMENT_DELIMITER = "|||SPLIT|||"
 _PREPARED_SEGMENTS_MARKER = "[smart_segmentation_plugin:segments]"
 _PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY = "smart_segmentation_prepared_segments"
@@ -393,34 +394,9 @@ def _get_outbound_additional_config(message: dict[str, Any]) -> dict[str, Any]:
     return additional_config
 
 
-def _is_plugin_command_feedback_text(text: str) -> bool:
-    """识别本插件自身发送的帮助/状态文本，避免被再次分段。"""
-    normalized_text = str(text or "").strip()
-    if not normalized_text:
-        return False
-
-    if normalized_text == "用法: /smart_seg [on|off|status]":
-        return True
-
-    if normalized_text in {"智能分段已开启", "智能分段已关闭"}:
-        return True
-
-    if normalized_text.startswith("智能分段当前状态: "):
-        return True
-
-    if normalized_text.startswith("智能分段已"):
-        return True
-
-    return False
-
-
 def _should_apply_after_build_fallback(message: dict[str, Any], *, storage_message: bool = True) -> bool:
     """对大多数纯文本出站消息启用发送前兜底分段。"""
     additional_config = _get_outbound_additional_config(message)
-    outbound_text = _strip_thinking_content(_extract_plain_text_outbound_message(message))
-
-    if _is_plugin_command_feedback_text(outbound_text):
-        return False
 
     selected_expressions = additional_config.get("selected_expressions")
     if isinstance(selected_expressions, list) and selected_expressions:
@@ -513,6 +489,34 @@ def _resolve_pending_follow_up_segments(*, message_id: Any, tracking_key: Any) -
     return None
 
 
+def _mark_command_stream_active(stream_id: Any) -> None:
+    """标记当前聊天流正在执行命令。"""
+    normalized_stream_id = str(stream_id or "").strip()
+    if not normalized_stream_id:
+        return
+    _active_command_streams[normalized_stream_id] = _active_command_streams.get(normalized_stream_id, 0) + 1
+
+
+def _mark_command_stream_inactive(stream_id: Any) -> None:
+    """清理当前聊天流的命令执行标记。"""
+    normalized_stream_id = str(stream_id or "").strip()
+    if not normalized_stream_id:
+        return
+    remaining = _active_command_streams.get(normalized_stream_id, 0) - 1
+    if remaining > 0:
+        _active_command_streams[normalized_stream_id] = remaining
+    else:
+        _active_command_streams.pop(normalized_stream_id, None)
+
+
+def _is_command_stream_active(stream_id: Any) -> bool:
+    """判断当前聊天流是否正处于命令执行中。"""
+    normalized_stream_id = str(stream_id or "").strip()
+    if not normalized_stream_id:
+        return False
+    return _active_command_streams.get(normalized_stream_id, 0) > 0
+
+
 def _is_stream_guarded(stream_id: str) -> bool:
     """判断当前流是否处于插件补发保护期。"""
     return _stream_resend_guards.get(stream_id, 0) > 0
@@ -546,6 +550,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         """处理插件加载。"""
         _pending_follow_up_segments.clear()
         _stream_resend_guards.clear()
+        _active_command_streams.clear()
         if _HOOK_HANDLER_COMPAT_MODE:
             logger.warning("当前 maibot_sdk 未提供 HookHandler，智能分段已退化为 EventHandler 兼容模式")
 
@@ -553,6 +558,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         """处理插件卸载。"""
         _pending_follow_up_segments.clear()
         _stream_resend_guards.clear()
+        _active_command_streams.clear()
 
     def _load_local_config_fallback(self) -> dict[str, Any]:
         """回退读取插件目录下的 `config.toml`。"""
@@ -926,6 +932,40 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         }
 
     @HookHandler(
+        "chat.command.before_execute",
+        name="smart_segmentation_command_scope_enter",
+        description="在命令执行期间标记当前聊天流，避免命令回执被智能分段",
+    )
+    async def handle_command_before_execute(
+        self,
+        message: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """在命令执行前标记聊天流。"""
+        del kwargs
+
+        if isinstance(message, dict):
+            _mark_command_stream_active(message.get("session_id", ""))
+        return {"action": "continue"}
+
+    @HookHandler(
+        "chat.command.after_execute",
+        name="smart_segmentation_command_scope_leave",
+        description="在命令执行结束后清理聊天流标记",
+    )
+    async def handle_command_after_execute(
+        self,
+        message: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """在命令执行结束后清理聊天流标记。"""
+        del kwargs
+
+        if isinstance(message, dict):
+            _mark_command_stream_inactive(message.get("session_id", ""))
+        return {"action": "continue"}
+
+    @HookHandler(
         "send_service.after_build_message",
         name="smart_segmentation_after_build",
         description="在发送前消费预分段标记，首段保留原始发送链路",
@@ -948,6 +988,10 @@ class SmartSegmentationPlugin(MaiBotPlugin):
 
         normalized_stream_id = str(stream_id or message.get("session_id", "") or "").strip()
         if not normalized_stream_id or _is_stream_guarded(normalized_stream_id):
+            return {"action": "continue"}
+
+        if _is_command_stream_active(normalized_stream_id):
+            logger.debug("智能分段跳过发送前兜底：当前聊天流正在执行命令")
             return {"action": "continue"}
 
         settings = await self._get_segmentation_runtime_settings()
