@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import re
+import time
 import tomllib
 
 from maibot_sdk import Command, EventHandler, MaiBotPlugin
@@ -17,19 +18,21 @@ from maibot_sdk.types import EventType
 from src.config.model_configs import TaskConfig
 from src.llm_models.utils_model import LLMOrchestrator
 
+_CUSTOM_HOOK_HANDLER_ATTR = "__smart_segmentation_custom_hook_handler__"
+
 try:
     from maibot_sdk import Field, HookHandler, PluginConfigBase
     from maibot_sdk.types import HookMode
 
-    _HOOK_HANDLER_COMPAT_MODE = False
+    _SDK_HOOK_HANDLER_AVAILABLE = True
 except ImportError:
     from pydantic import BaseModel, Field
 
     PluginConfigBase = BaseModel
-    _HOOK_HANDLER_COMPAT_MODE = True
+    _SDK_HOOK_HANDLER_AVAILABLE = False
 
     class HookMode:
-        """旧版 SDK 兼容占位。"""
+        """当前宿主缺失 HookMode 时的最小兼容定义。"""
 
         BLOCKING = "blocking"
         OBSERVE = "observe"
@@ -41,22 +44,23 @@ except ImportError:
         mode: Any = None,
         **metadata: Any,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """在旧版 SDK 上把 HookHandler 退化为接近语义的 EventHandler。"""
-        event_type_map = {
-            "send_service.after_build_message": EventType.POST_SEND_PRE_PROCESS,
-            "send_service.after_send": EventType.AFTER_SEND,
-        }
-        event_type = event_type_map.get(hook_name, EventType.ON_MESSAGE)
-        intercept_message = mode != HookMode.OBSERVE
-        compat_metadata = dict(metadata)
-        compat_metadata.setdefault("compat_hook_name", hook_name)
-        return EventHandler(
-            name=name or hook_name.replace(".", "_"),
-            description=description,
-            event_type=event_type,
-            intercept_message=intercept_message,
-            **compat_metadata,
-        )
+        """在缺失 SDK HookHandler 时，自行声明 host 可识别的 hook_handler 组件。"""
+
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            setattr(
+                func,
+                _CUSTOM_HOOK_HANDLER_ATTR,
+                {
+                    "hook": str(hook_name or "").strip(),
+                    "name": str(name or hook_name.replace(".", "_") or func.__name__).strip(),
+                    "description": description,
+                    "mode": HookMode.OBSERVE if mode == HookMode.OBSERVE else HookMode.BLOCKING,
+                    "metadata": dict(metadata),
+                },
+            )
+            return func
+
+        return decorator
 
 logger = logging.getLogger("plugin.smart_segmentation")
 
@@ -64,6 +68,7 @@ _runtime_enabled = True
 _pending_follow_up_segments: dict[str, dict[str, Any]] = {}
 _stream_resend_guards: dict[str, int] = {}
 _active_command_streams: dict[str, int] = {}
+_recent_command_stream_expiries: dict[str, float] = {}
 _SEGMENT_DELIMITER = "|||SPLIT|||"
 _PREPARED_SEGMENTS_MARKER = "[smart_segmentation_plugin:segments]"
 _PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY = "smart_segmentation_prepared_segments"
@@ -71,6 +76,10 @@ _REPLYER_SEGMENT_MARKERS = (
     "[smart_segmentation_plugin:replyer]",
     "[replyer]",
 )
+# 命令回执的同步发送链路已被 _active_command_streams 精确覆盖，这里的窗口只用来兜住
+# 命令 hook 与 send_service 之间可能存在的轻微异步抖动（毫秒到秒级），过长会把命令后的
+# 正常业务主回复一起误伤——曾出现 90s 窗口导致重启后首个 @ 回复不分段的问题。
+_COMMAND_REPLY_GRACE_SECONDS = 2.0
 
 
 class _PinnedTaskLLMOrchestrator(LLMOrchestrator):
@@ -257,6 +266,14 @@ def _build_prepared_segments_marker_text(segments: list[str]) -> str:
     return f"{_PREPARED_SEGMENTS_MARKER}{encoded_segments}"
 
 
+def _get_top_level_additional_data(message: dict[str, Any]) -> dict[str, Any]:
+    """提取事件消息上的 additional_data。"""
+    additional_data = message.get("additional_data")
+    if not isinstance(additional_data, dict):
+        return {}
+    return additional_data
+
+
 def _inject_prepared_segments_into_message(message: dict[str, Any], segments: list[str]) -> None:
     """将预分段结果同时写入文本标记与 additional_data，避免后续链路改写正文后丢失。"""
     encoded_segments = _encode_prepared_segments(segments)
@@ -271,6 +288,16 @@ def _inject_prepared_segments_into_message(message: dict[str, Any], segments: li
         additional_data = {}
         message["additional_data"] = additional_data
     additional_data[_PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY] = encoded_segments
+
+    message_info = message.get("message_info")
+    if not isinstance(message_info, dict):
+        message_info = {}
+        message["message_info"] = message_info
+    additional_config = message_info.get("additional_config")
+    if not isinstance(additional_config, dict):
+        additional_config = {}
+        message_info["additional_config"] = additional_config
+    additional_config[_PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY] = encoded_segments
 
 
 def _extract_marked_segments(text: str) -> tuple[list[str], str]:
@@ -303,6 +330,13 @@ def _extract_prepared_segments_from_outbound_message(
     display_message: str = "",
 ) -> tuple[list[str], str]:
     """从发送链消息里提取预分段标记（含 replyer 标记兜底）。"""
+    top_level_additional_data = _get_top_level_additional_data(message)
+    encoded_segments = str(top_level_additional_data.get(_PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY, "") or "").strip()
+    if encoded_segments:
+        segments = _decode_prepared_segments(encoded_segments)
+        if segments:
+            return segments, "additional_data"
+
     additional_config = _get_outbound_additional_config(message)
     encoded_segments = str(additional_config.get(_PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY, "") or "").strip()
     if encoded_segments:
@@ -495,6 +529,7 @@ def _mark_command_stream_active(stream_id: Any) -> None:
     if not normalized_stream_id:
         return
     _active_command_streams[normalized_stream_id] = _active_command_streams.get(normalized_stream_id, 0) + 1
+    _recent_command_stream_expiries[normalized_stream_id] = time.monotonic() + _COMMAND_REPLY_GRACE_SECONDS
 
 
 def _mark_command_stream_inactive(stream_id: Any) -> None:
@@ -507,6 +542,8 @@ def _mark_command_stream_inactive(stream_id: Any) -> None:
         _active_command_streams[normalized_stream_id] = remaining
     else:
         _active_command_streams.pop(normalized_stream_id, None)
+    # 故意不在命令结束时续期：before_execute 设定的短窗口足够覆盖回执同步发送，
+    # 再次续期会把命令结束后的正常业务主回复一起挡住。
 
 
 def _is_command_stream_active(stream_id: Any) -> bool:
@@ -515,6 +552,23 @@ def _is_command_stream_active(stream_id: Any) -> bool:
     if not normalized_stream_id:
         return False
     return _active_command_streams.get(normalized_stream_id, 0) > 0
+
+
+def _get_command_stream_grace_remaining(stream_id: Any) -> float | None:
+    """返回保护窗口剩余秒数；未命中返回 None。"""
+    normalized_stream_id = str(stream_id or "").strip()
+    if not normalized_stream_id:
+        return None
+
+    expires_at = _recent_command_stream_expiries.get(normalized_stream_id)
+    if expires_at is None:
+        return None
+
+    remaining = expires_at - time.monotonic()
+    if remaining <= 0:
+        _recent_command_stream_expiries.pop(normalized_stream_id, None)
+        return None
+    return remaining
 
 
 def _is_stream_guarded(stream_id: str) -> bool:
@@ -541,24 +595,71 @@ def _guard_stream_resend(stream_id: str):
             _stream_resend_guards.pop(normalized_stream_id, None)
 
 
+def _collect_custom_hook_components(plugin_instance: MaiBotPlugin) -> list[dict[str, Any]]:
+    """收集当前文件自定义声明的 hook_handler 组件。"""
+    components: list[dict[str, Any]] = []
+    for attr_name in dir(plugin_instance):
+        try:
+            attr = getattr(plugin_instance, attr_name)
+        except Exception:
+            continue
+        if not callable(attr):
+            continue
+
+        hook_info = getattr(attr, _CUSTOM_HOOK_HANDLER_ATTR, None)
+        if not isinstance(hook_info, dict):
+            continue
+
+        component_name = str(hook_info.get("name", "") or attr_name).strip()
+        if not component_name:
+            continue
+
+        component_metadata = {
+            "description": str(hook_info.get("description", "") or "").strip(),
+            "enabled": True,
+            "hook": str(hook_info.get("hook", "") or "").strip(),
+            "mode": str(hook_info.get("mode", HookMode.BLOCKING) or HookMode.BLOCKING).strip().lower(),
+            "handler_name": attr_name,
+            **(hook_info.get("metadata") if isinstance(hook_info.get("metadata"), dict) else {}),
+        }
+        components.append(
+            {
+                "name": component_name,
+                "type": "hook_handler",
+                "metadata": component_metadata,
+            }
+        )
+    return components
+
+
 class SmartSegmentationPlugin(MaiBotPlugin):
     """使用 LLM 对主回复进行智能分段，并直接分条发送。"""
 
     config_model = SmartSegmentationConfig
+
+    def get_components(self) -> list[dict[str, Any]]:
+        """补充当前 SDK 未导出的 hook_handler 声明。"""
+        components = list(super().get_components())
+        if _SDK_HOOK_HANDLER_AVAILABLE:
+            return components
+        components.extend(_collect_custom_hook_components(self))
+        return components
 
     async def on_load(self) -> None:
         """处理插件加载。"""
         _pending_follow_up_segments.clear()
         _stream_resend_guards.clear()
         _active_command_streams.clear()
-        if _HOOK_HANDLER_COMPAT_MODE:
-            logger.warning("当前 maibot_sdk 未提供 HookHandler，智能分段已退化为 EventHandler 兼容模式")
+        _recent_command_stream_expiries.clear()
+        if not _SDK_HOOK_HANDLER_AVAILABLE:
+            logger.info("当前 maibot_sdk 未导出 HookHandler，智能分段已启用内置 hook_handler 声明兼容")
 
     async def on_unload(self) -> None:
         """处理插件卸载。"""
         _pending_follow_up_segments.clear()
         _stream_resend_guards.clear()
         _active_command_streams.clear()
+        _recent_command_stream_expiries.clear()
 
     def _load_local_config_fallback(self) -> dict[str, Any]:
         """回退读取插件目录下的 `config.toml`。"""
@@ -993,6 +1094,13 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         if _is_command_stream_active(normalized_stream_id):
             logger.debug("智能分段跳过发送前兜底：当前聊天流正在执行命令")
             return {"action": "continue"}
+        grace_remaining = _get_command_stream_grace_remaining(normalized_stream_id)
+        if grace_remaining is not None:
+            logger.info(
+                "智能分段跳过发送前兜底：当前聊天流处于命令回执保护窗口，剩余 %.2fs",
+                grace_remaining,
+            )
+            return {"action": "continue"}
 
         settings = await self._get_segmentation_runtime_settings()
         if settings is None:
@@ -1056,6 +1164,8 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         )
         if marker_source == "replyer":
             logger.info("智能分段已从 replyer 兜底标记恢复，原始发送保留首段并登记 %s 条补发消息", len(follow_up_segments))
+        elif marker_source == "additional_data":
+            logger.info("智能分段已从 additional_data 恢复预分段，原始发送保留首段并登记 %s 条补发消息", len(follow_up_segments))
         elif marker_source == "additional_config":
             logger.info("智能分段已从 additional_config 恢复预分段，原始发送保留首段并登记 %s 条补发消息", len(follow_up_segments))
         elif marker_source == "after_build_fallback":
