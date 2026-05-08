@@ -372,6 +372,39 @@ def _normalize_segments(segments: Any, *, max_segments: int) -> list[str]:
     return normalized_segments[:max_segments]
 
 
+def _render_mention_component_text(component: dict[str, Any]) -> str:
+    """将真实艾特组件渲染为用于分段判断的可见文本。"""
+    component_data = component.get("data")
+    if isinstance(component_data, dict):
+        target_text = ""
+        for key in (
+            "target_user_cardname",
+            "target_user_nickname",
+            "card",
+            "nickname",
+            "name",
+            "target_user_id",
+            "user_id",
+            "qq",
+            "id",
+        ):
+            target_text = str(component_data.get(key, "") or "").strip()
+            if target_text:
+                break
+    else:
+        target_text = str(component_data or "").strip()
+
+    if not target_text:
+        return ""
+    if target_text.startswith("@"):
+        return target_text
+    return f"@{target_text}"
+
+
+def _is_mention_component_type(component_type: str) -> bool:
+    return component_type in {"at", "mention", "mention_bot"}
+
+
 def _extract_plain_text_outbound_message(message: dict[str, Any], display_message: str = "") -> str:
     """从发送链消息中提取可安全分段的纯文本。"""
     raw_components = message.get("raw_message")
@@ -390,7 +423,17 @@ def _extract_plain_text_outbound_message(message: dict[str, Any], display_messag
                 parts.append(text)
             continue
 
-        # 只处理纯文本消息，避免打乱图片/语音/艾特等结构。
+        if _is_mention_component_type(component_type):
+            mention_text = _render_mention_component_text(component)
+            if not mention_text:
+                return ""
+            parts.append(mention_text)
+            continue
+
+        if component_type == "reply":
+            continue
+
+        # 只处理文本、真实艾特与引用元数据，避免打乱图片/语音等结构。
         return ""
 
     text = "".join(parts).strip()
@@ -399,10 +442,58 @@ def _extract_plain_text_outbound_message(message: dict[str, Any], display_messag
     return str(display_message or "").strip()
 
 
+def _clone_message_component(component: dict[str, Any]) -> dict[str, Any]:
+    cloned_component = dict(component)
+    component_data = component.get("data")
+    if isinstance(component_data, dict):
+        cloned_component["data"] = dict(component_data)
+    return cloned_component
+
+
+def _build_replaced_outbound_raw_message(message: dict[str, Any], new_text: str) -> list[dict[str, Any]]:
+    raw_components = message.get("raw_message")
+    if not isinstance(raw_components, list):
+        return [{"type": "text", "data": new_text}]
+
+    replaced_components: list[dict[str, Any]] = []
+    remaining_text = new_text
+    for component in raw_components:
+        if not isinstance(component, dict):
+            return [{"type": "text", "data": new_text}]
+
+        component_type = str(component.get("type", "") or "").strip().lower()
+        if component_type == "text":
+            continue
+
+        if not _is_mention_component_type(component_type):
+            return [{"type": "text", "data": new_text}]
+
+        mention_text = _render_mention_component_text(component)
+        if not mention_text:
+            return [{"type": "text", "data": new_text}]
+
+        mention_index = remaining_text.find(mention_text)
+        if mention_index < 0:
+            continue
+
+        prefix_text = remaining_text[:mention_index]
+        if prefix_text:
+            replaced_components.append({"type": "text", "data": prefix_text})
+        replaced_components.append(_clone_message_component(component))
+        remaining_text = remaining_text[mention_index + len(mention_text) :]
+
+    if not replaced_components:
+        return [{"type": "text", "data": new_text}]
+
+    if remaining_text:
+        replaced_components.append({"type": "text", "data": remaining_text})
+    return replaced_components
+
+
 def _replace_outbound_text(message: dict[str, Any], new_text: str) -> dict[str, Any]:
     """将发送链消息改写为新的单条纯文本。"""
     updated_message = dict(message)
-    updated_message["raw_message"] = [{"type": "text", "data": new_text}]
+    updated_message["raw_message"] = _build_replaced_outbound_raw_message(message, new_text)
     updated_message["processed_plain_text"] = new_text
     updated_message["display_message"] = new_text
     message_info = updated_message.get("message_info")
@@ -429,7 +520,7 @@ def _get_outbound_additional_config(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def _should_apply_after_build_fallback(message: dict[str, Any], *, storage_message: bool = True) -> bool:
-    """对大多数纯文本出站消息启用发送前兜底分段。"""
+    """仅对可确认属于 bot 主回复的出站消息启用发送前兜底分段。"""
     additional_config = _get_outbound_additional_config(message)
 
     selected_expressions = additional_config.get("selected_expressions")
@@ -450,9 +541,8 @@ def _should_apply_after_build_fallback(message: dict[str, Any], *, storage_messa
     if not storage_message:
         return False
 
-    # 宿主链路近期出现了 reply_to / replyer 标记缺失的情况，
-    # 这里回退到“只要是纯文本出站消息就尝试分段”，避免正常主回复被跳过。
-    return True
+    # 这里必须严格限制在 bot 主回复上下文内，避免日志、命令回执和其他插件主动输出被误分段。
+    return False
 
 
 def _normalize_pending_lookup_keys(*keys: Any) -> list[str]:
@@ -1199,8 +1289,8 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         normalized_stream_id = str(message.get("session_id", "") or "").strip()
         tracking_text = str(
             message.get("display_message", "")
-            or message.get("processed_plain_text", "")
             or _extract_plain_text_outbound_message(message)
+            or message.get("processed_plain_text", "")
             or ""
         ).strip()
         tracking_key = _build_follow_up_tracking_key(
