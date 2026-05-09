@@ -15,7 +15,7 @@
     "issues": "https://github.com/saberlights/smart_segmentation_plugin/issues"
   },
   "host_application": {
-    "min_version": "0.11.0",
+    "min_version": "1.0.0",
     "max_version": "1.0.0"
   },
   "sdk": {

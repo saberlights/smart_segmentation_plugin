@@ -76,6 +76,12 @@ _REPLYER_SEGMENT_MARKERS = (
     "[smart_segmentation_plugin:replyer]",
     "[replyer]",
 )
+_DIAGNOSTIC_OUTBOUND_TEXT_PATTERNS = (
+    re.compile(r"^(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\b"),
+    re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\b"),
+    re.compile(r"^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b"),
+    re.compile(r"^Traceback \(most recent call last\):"),
+)
 # 命令回执的同步发送链路已被 _active_command_streams 精确覆盖，这里的窗口只用来兜住
 # 命令 hook 与 send_service 之间可能存在的轻微异步抖动（毫秒到秒级），过长会把命令后的
 # 正常业务主回复一起误伤——曾出现 90s 窗口导致重启后首个 @ 回复不分段的问题。
@@ -519,7 +525,20 @@ def _get_outbound_additional_config(message: dict[str, Any]) -> dict[str, Any]:
     return additional_config
 
 
-def _should_apply_after_build_fallback(message: dict[str, Any], *, storage_message: bool = True) -> bool:
+def _looks_like_diagnostic_outbound_text(text: str) -> bool:
+    """识别日志/诊断文本，避免把宿主或插件输出误判成主回复。"""
+    normalized_text = " ".join(str(text or "").split())
+    if not normalized_text:
+        return False
+    return any(pattern.search(normalized_text) for pattern in _DIAGNOSTIC_OUTBOUND_TEXT_PATTERNS)
+
+
+def _should_apply_after_build_fallback(
+    message: dict[str, Any],
+    display_message: str = "",
+    *,
+    storage_message: bool = True,
+) -> bool:
     """仅对可确认属于 bot 主回复的出站消息启用发送前兜底分段。"""
     additional_config = _get_outbound_additional_config(message)
 
@@ -541,8 +560,16 @@ def _should_apply_after_build_fallback(message: dict[str, Any], *, storage_messa
     if not storage_message:
         return False
 
-    # 这里必须严格限制在 bot 主回复上下文内，避免日志、命令回执和其他插件主动输出被误分段。
-    return False
+    outbound_text = _strip_thinking_content(_extract_plain_text_outbound_message(message, display_message))
+    if not outbound_text:
+        return False
+
+    if _looks_like_diagnostic_outbound_text(outbound_text):
+        return False
+
+    # Maisaka reply 会先走宿主回复后处理，再直接把纯文本送入 send_service。
+    # 这条链路下经常没有 reply_to / selected_expressions，但它依然是真正的 bot 主回复。
+    return True
 
 
 def _normalize_pending_lookup_keys(*keys: Any) -> list[str]:
@@ -1200,6 +1227,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         if not segments or len(segments) <= 1:
             if not _should_apply_after_build_fallback(
                 message,
+                display_message,
                 storage_message=bool(updated_kwargs.get("storage_message", True)),
             ):
                 logger.debug("智能分段跳过发送前兜底：当前消息不满足兜底条件")

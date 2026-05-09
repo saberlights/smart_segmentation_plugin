@@ -289,6 +289,62 @@ def test_after_build_keeps_fallback_for_explicit_reply_context() -> None:
         plugin_module._stream_resend_guards.clear()
 
 
+def test_after_build_allows_plain_bot_reply_without_reply_context() -> None:
+    plugin = SmartSegmentationPlugin()
+    runtime_settings = {
+        "min_length": 8,
+        "max_segments": 8,
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "style": "natural",
+        "model_name": "",
+        "delay_base": 0.35,
+        "delay_per_char": 0.015,
+        "delay_max": 1.2,
+    }
+    segment_text_mock = AsyncMock(return_value=["第一段", "第二段"])
+
+    try:
+        with (
+            patch.object(plugin, "_get_segmentation_runtime_settings", AsyncMock(return_value=runtime_settings)),
+            patch.object(plugin, "_segment_text", segment_text_mock),
+        ):
+            result = asyncio.run(
+                plugin.handle_smart_segmentation_after_build(
+                    message={
+                        "message_id": "plain-reply-msg-1",
+                        "session_id": "stream-plain-reply",
+                        "timestamp": "4000.0",
+                        "raw_message": [
+                            {
+                                "type": "text",
+                                "data": "好耶今天真的还挺开心的，晚点我再慢慢跟你讲。",
+                            }
+                        ],
+                        "message_info": {"additional_config": {}},
+                    },
+                    stream_id="stream-plain-reply",
+                    display_message="好耶今天真的还挺开心的，晚点我再慢慢跟你讲。",
+                )
+            )
+
+        segment_text_mock.assert_awaited_once_with(
+            "好耶今天真的还挺开心的，晚点我再慢慢跟你讲。",
+            style="natural",
+            model_name="",
+            max_segments=8,
+            temperature=0.3,
+            max_tokens=600,
+        )
+        assert result["action"] == "continue"
+        assert result["modified_kwargs"]["display_message"] == "第一段"
+        assert result["modified_kwargs"]["message"]["display_message"] == "第一段"
+        assert plugin_module._pending_follow_up_segments
+    finally:
+        plugin_module._pending_follow_up_segments.clear()
+        plugin_module._stream_resend_guards.clear()
+
+
 def _reset_command_stream_state() -> None:
     plugin_module._active_command_streams.clear()
     plugin_module._recent_command_stream_expiries.clear()
