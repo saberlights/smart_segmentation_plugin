@@ -345,6 +345,58 @@ def test_after_build_allows_plain_bot_reply_without_reply_context() -> None:
         plugin_module._stream_resend_guards.clear()
 
 
+def test_after_build_timeout_keeps_original_send_path() -> None:
+    plugin = SmartSegmentationPlugin()
+    runtime_settings = {
+        "min_length": 8,
+        "max_segments": 8,
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "style": "natural",
+        "model_name": "",
+        "delay_base": 0.35,
+        "delay_per_char": 0.015,
+        "delay_max": 1.2,
+    }
+
+    async def slow_segment(*args: object, **kwargs: object) -> list[str]:
+        del args
+        del kwargs
+        await asyncio.sleep(0.02)
+        return ["第一段", "第二段"]
+
+    try:
+        with (
+            patch.object(plugin, "_get_segmentation_runtime_settings", AsyncMock(return_value=runtime_settings)),
+            patch.object(plugin, "_segment_text", AsyncMock(side_effect=slow_segment)),
+            patch.object(plugin_module, "_AFTER_BUILD_FALLBACK_SEGMENT_TIMEOUT_SECONDS", 0.001),
+        ):
+            result = asyncio.run(
+                plugin.handle_smart_segmentation_after_build(
+                    message={
+                        "message_id": "plain-reply-timeout-1",
+                        "session_id": "stream-timeout",
+                        "timestamp": "5000.0",
+                        "raw_message": [
+                            {
+                                "type": "text",
+                                "data": "这是一条会在发送前兜底链路里故意超时的长回复，用来验证插件会直接放行原始消息。",
+                            }
+                        ],
+                        "message_info": {"additional_config": {}},
+                    },
+                    stream_id="stream-timeout",
+                    display_message="这是一条会在发送前兜底链路里故意超时的长回复，用来验证插件会直接放行原始消息。",
+                )
+            )
+
+        assert result == {"action": "continue"}
+        assert not plugin_module._pending_follow_up_segments
+    finally:
+        plugin_module._pending_follow_up_segments.clear()
+        plugin_module._stream_resend_guards.clear()
+
+
 def _reset_command_stream_state() -> None:
     plugin_module._active_command_streams.clear()
     plugin_module._recent_command_stream_expiries.clear()

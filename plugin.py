@@ -82,6 +82,7 @@ _DIAGNOSTIC_OUTBOUND_TEXT_PATTERNS = (
     re.compile(r"^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b"),
     re.compile(r"^Traceback \(most recent call last\):"),
 )
+_AFTER_BUILD_FALLBACK_SEGMENT_TIMEOUT_SECONDS = 8.0
 # 命令回执的同步发送链路已被 _active_command_streams 精确覆盖，这里的窗口只用来兜住
 # 命令 hook 与 send_service 之间可能存在的轻微异步抖动（毫秒到秒级），过长会把命令后的
 # 正常业务主回复一起误伤——曾出现 90s 窗口导致重启后首个 @ 回复不分段的问题。
@@ -1242,14 +1243,24 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                 )
                 return {"action": "continue"}
 
-            segments = await self._segment_text(
-                outbound_text,
-                style=settings["style"],
-                model_name=settings["model_name"],
-                max_segments=settings["max_segments"],
-                temperature=settings["temperature"],
-                max_tokens=settings["max_tokens"],
-            )
+            try:
+                segments = await asyncio.wait_for(
+                    self._segment_text(
+                        outbound_text,
+                        style=settings["style"],
+                        model_name=settings["model_name"],
+                        max_segments=settings["max_segments"],
+                        temperature=settings["temperature"],
+                        max_tokens=settings["max_tokens"],
+                    ),
+                    timeout=_AFTER_BUILD_FALLBACK_SEGMENT_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "智能分段发送前兜底超时（> %.2fs），本次保留原消息直接发送",
+                    _AFTER_BUILD_FALLBACK_SEGMENT_TIMEOUT_SECONDS,
+                )
+                return {"action": "continue"}
             if not segments or len(segments) <= 1:
                 return {"action": "continue"}
             marker_source = "after_build_fallback"
