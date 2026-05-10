@@ -1,26 +1,33 @@
 # 智能分段插件 (Smart Segmentation Plugin)
 
-## 📝 功能说明
+使用 LLM 在语义自然的位置切分回复，把一段完整文本拆成多条连续消息，让 Bot 的发言节奏更像真人聊天，而不是一次性整段发出。
 
-使用 LLM 模拟真人聊天的发消息节奏，将回复智能拆分成多条消息，去掉末尾句号、保留情绪标点，让 bot 的回复像真人在微信里一条一条发出来。
+## 适合什么场景
 
-### 主要特点
+- 希望回复看起来更像微信/QQ 的连续聊天，而不是公告式长段文本
+- 想保留原文语义，只调整发送节奏
+- 使用较小模型完成低成本分段任务
 
-- ✅ **真人节奏**：模拟手机聊天分条发送，短反应词单独一条，相关内容合并
-- ✅ **去句号**：自动去掉每条消息末尾的句号，保留感叹号、问号、省略号等情绪标点
-- ✅ **长短不均**：消息长短自然不均匀，避免机械的均匀切分
-- ✅ **三种风格**：natural / conservative / active，适配不同人设
-- ✅ **小模型友好**：任务简单，14B+ 的模型即可稳定运行
+## 核心能力
 
-## 🚀 使用方法
+- 自然切分：按语义停顿拆分，不做机械平均分句
+- 节奏模拟：支持短句单发、正文连发，以及按字数变化的发送间隔
+- 末尾清理：自动去掉句号，保留问号、感叹号、省略号等情绪标点
+- 风格切换：`natural` / `conservative` / `active`
+- 模型直连：`model` 支持 task 名、`[[models]].name`、`[[models]].model_identifier`
+- 安全回退：LLM 返回异常或 JSON 解析失败时，自动回退为原文直发
 
-### 1. 禁用内置分段（必须！）
+## 快速开始
+
+### 1. 关闭宿主内置分段
+
+必须先禁用宿主自带的 `response_splitter`，否则会和本插件重复切分。
 
 编辑 `config/bot_config.toml`：
 
 ```toml
 [response_splitter]
-enable = false  # 必须禁用内置分段，否则会冲突
+enable = false
 ```
 
 ### 2. 启用插件
@@ -34,120 +41,129 @@ enabled = true
 
 [segmentation]
 enabled = true
-style = "natural"    # 切分风格
-min_length = 15      # 最小切分长度
-max_segments = 8     # 最大段数
+model = "doubao1.6"
+style = "natural"
+min_length = 8
+max_segments = 8
+delay_base = 0.35
+delay_per_char = 0.015
+delay_max = 1.2
 ```
 
-### 3. 配置模型
+### 3. 准备模型
 
-在宿主的模型配置中准备好可用模型后，插件配置里的 `model` 支持三种写法：task 名、`[[models]].name`，或 `[[models]].model_identifier`。当你填写具体模型时，插件会像 `nai_pic_plugin` 一样直接固定到该模型，不需要你再去改 `model_task_config`。留空时交给宿主默认模型处理。
+推荐使用响应快、价格低的小模型，例如 `gpt-4o-mini`、`qwen-plus`、`deepseek` 一类。这个任务只做文本切分，通常不需要大模型。
 
-```toml
-[segmentation]
-model = "doubao1.6"  # 也可以写具体 model_identifier 或 utils
-```
+`model` 的解析顺序可以理解为：
 
-推荐使用小模型（gpt-4o-mini、qwen-plus、deepseek 等），分段任务对模型能力要求不高。
+1. 直接写 task 名，例如 `utils`
+2. 直接写宿主 `model_config.toml` 里的 `[[models]].name`
+3. 直接写 `[[models]].model_identifier`
+4. 留空则交给宿主默认模型链路
 
-## ⚙️ 配置说明
+## 配置说明
 
-### 切分风格 (style)
+| 配置项 | 说明 | 建议值 |
+| --- | --- | --- |
+| `plugin.enabled` | 插件总开关 | `true` |
+| `segmentation.enabled` | 智能分段开关 | `true` |
+| `segmentation.model` | 分段所用模型，可填 task 名、模型名或模型标识 | 小模型即可 |
+| `segmentation.style` | 切分风格：`natural` / `conservative` / `active` | `natural` |
+| `segmentation.min_length` | 文本长度低于该值时不切分 | `8` 起步 |
+| `segmentation.max_segments` | 单次回复最大切分段数，避免刷屏 | `8` |
+| `segmentation.delay_base` | 每段发送的基础延迟，单位秒 | `0.35` |
+| `segmentation.delay_per_char` | 按文本长度附加延迟，单位秒/字符 | `0.015` |
+| `segmentation.delay_max` | 单段最大发送延迟，单位秒 | `1.2` |
 
-- **natural**（推荐）：像和朋友微信聊天一样自然地分条发送，有的消息短有的长，节奏随意
-- **conservative**：偏沉稳的发消息风格，一条消息说比较完整的内容，不会频繁发短消息
-- **active**：活泼的发消息风格，喜欢发短消息连击，反应词和正文分开发
+### 风格差异
 
-### 最小长度 (min_length)
+- `natural`：最像日常聊天，长短不均，适合作为默认风格
+- `conservative`：尽量少切，单条更完整，适合偏稳重人设
+- `active`：更容易拆成短句连发，适合活泼人设
 
-小于此长度的文本不会切分，默认 15 字符。
+## 效果示例
 
-### 最大段数 (max_segments)
+原文：
 
-切分段数上限，避免长文刷屏，默认 8 段。
-
-## 📊 效果示例
-
-### 示例 1：日常闲聊
-
-**原文：**
-```
+```text
 我今天去了那个新开的咖啡店，环境还不错。点了一杯拿铁，味道一般般吧，没有之前那家好喝。对了你上次推荐的那本书我看完了，超好看！
 ```
 
-**分条结果：**
-```
-消息1: "我今天去了那个新开的咖啡店，环境还不错"
-消息2: "点了一杯拿铁，味道一般般吧，没有之前那家好喝"
-消息3: "对了你上次推荐的那本书我看完了"
-消息4: "超好看！"
+可能的分段结果：
+
+```text
+1. 我今天去了那个新开的咖啡店，环境还不错
+2. 点了一杯拿铁，味道一般般吧，没有之前那家好喝
+3. 对了你上次推荐的那本书我看完了
+4. 超好看！
 ```
 
-### 示例 2：短反应 + 正文
+这个结果体现的是：
 
-**原文：**
-```
-哈哈真的吗，那太好了！我还以为你不喜欢呢。下次我们一起去看电影吧，最近有个新片子挺有意思的。
-```
+- 句号被去掉，但情绪标点被保留
+- 短反应句可以单独成段
+- 相关语义不会被逗号强行拆碎
 
-**分条结果：**
-```
-消息1: "哈哈真的吗"
-消息2: "那太好了！我还以为你不喜欢呢"
-消息3: "下次我们一起去看电影吧，最近有个新片子挺有意思的"
-```
-
-**特点：**
-- ✅ 去掉了末尾句号
-- ✅ 保留了「！」情绪标点
-- ✅ 短反应「哈哈真的吗」单独一条
-- ✅ 相关内容没有被逗号过度拆分
-
-## 🔧 命令
+## 命令
 
 | 命令 | 说明 |
-|------|------|
-| `/smart_seg` | 切换开关状态 |
+| --- | --- |
+| `/smart_seg` | 直接切换当前运行时开关 |
 | `/smart_seg on` | 开启智能分段 |
 | `/smart_seg off` | 关闭智能分段 |
-| `/smart_seg status` | 查看当前状态 |
+| `/smart_seg status` | 查看运行时状态和配置状态 |
 
-## 🔧 工作原理
+命令只影响运行时开关，不会回写 `config.toml`。
 
-1. **AFTER_LLM 预处理**：在 `AFTER_LLM` 阶段先把主回复切成多段，并写入内部标记
-2. **发送前消费标记**：在 `send_service.after_build_message` 阶段读取标记后的文本
-3. **首段改写**：首条消息仍走原始发送链路，保留宿主发送上下文
-4. **发送后补发**：在 `send_service.after_send` 成功后补发剩余段落
-5. **重入保护**：插件自行补发的消息不会再次被智能分段
+## 工作流程
 
-## ⚠️ 注意事项
+1. 在 `AFTER_LLM` 阶段拿到主回复文本
+2. 调用 LLM 生成分段结果，并把结果写入内部标记
+3. 在 `send_service.after_build_message` 阶段把首段替换进原消息
+4. 在 `send_service.after_send` 阶段按延迟补发剩余段落
+5. 使用重入保护，避免插件自己补发的消息再次被切分
 
-1. **必须禁用内置分段**：在 `config/bot_config.toml` 中设置 `response_splitter.enable = false`
-2. **模型选择**：14B+ 的小模型即可，推荐 gpt-4o-mini、qwen-plus 等
-3. **段数限制**：默认最多 8 段，可通过 `max_segments` 调整
+这种设计的好处是：首条消息仍然走宿主原始发送链路，引用、会话上下文和平台发送行为不会被破坏。
 
-## 🐛 故障排查
+## 故障排查
 
-### 插件未生效
+### 插件没生效
 
-1. 检查 `config.toml` 中 `enabled = true`
-2. 确认已禁用内置 `response_splitter`（在 `config/bot_config.toml` 中）
-3. 查看日志是否有“智能分段预切分完成”或“智能分段已消费预分段标记”相关日志
+按顺序检查：
 
-### 切分效果不理想
+1. `config.toml` 里 `plugin.enabled = true`
+2. `config.toml` 里 `segmentation.enabled = true`
+3. 宿主 `config/bot_config.toml` 里 `response_splitter.enable = false`
+4. 日志中是否出现智能分段开始、完成或消费预分段标记的记录
 
-- 调整 `style` 参数：`natural`（推荐）、`conservative`（少切分）、`active`（多切分）
-- 调整 `max_segments` 控制最大段数
+### 切得太碎或太密
+
+- 调大 `min_length`
+- 调小 `max_segments`
+- 把 `style` 改成 `conservative`
+- 增大 `delay_base` 或 `delay_per_char`
+
+### 切分不够明显
+
+- 把 `style` 改成 `active`
+- 调低 `min_length`
+- 调大 `max_segments`
 
 ### JSON 解析失败
 
-- 小模型偶尔输出格式不规范的 JSON，插件会自动 fallback 到原文不切分
-- 如果频繁失败，考虑换一个 JSON 输出更稳定的模型
+插件会自动回退为原文发送，不会阻塞主流程。若频繁出现，优先更换 JSON 输出更稳定的模型。
 
-## 📄 许可证
+## 兼容性
 
-GPL-v3.0-or-later
+- 插件版本：`1.0.0`
+- 宿主最低版本：`1.0.0`
+- SDK 支持范围：`1.0.0` - `2.99.99`
 
-## 👤 作者
+## 许可证
 
-久远
+`GPL-v3.0-or-later`
+
+## 作者
+
+- 久远
+- 仓库地址：<https://github.com/saberlights/smart_segmentation_plugin>
