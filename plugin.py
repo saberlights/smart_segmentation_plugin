@@ -1,10 +1,11 @@
 """智能分段插件。"""
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 import asyncio
-from contextlib import contextmanager
+import hashlib
 import json
 import logging
 import os
@@ -13,8 +14,7 @@ import re
 import time
 import tomllib
 
-from maibot_sdk import Command, EventHandler, MaiBotPlugin
-from maibot_sdk.types import EventType
+from maibot_sdk import Command, MaiBotPlugin
 from src.config.model_configs import TaskConfig
 from src.llm_models.utils_model import LLMOrchestrator
 
@@ -38,7 +38,7 @@ except ImportError:
         OBSERVE = "observe"
 
     def HookHandler(
-        hook_name: str,
+        hook: str,
         name: str = "",
         description: str = "",
         mode: Any = None,
@@ -51,8 +51,8 @@ except ImportError:
                 func,
                 _CUSTOM_HOOK_HANDLER_ATTR,
                 {
-                    "hook": str(hook_name or "").strip(),
-                    "name": str(name or hook_name.replace(".", "_") or func.__name__).strip(),
+                    "hook": str(hook or "").strip(),
+                    "name": str(name or hook.replace(".", "_") or func.__name__).strip(),
                     "description": description,
                     "mode": HookMode.OBSERVE if mode == HookMode.OBSERVE else HookMode.BLOCKING,
                     "metadata": dict(metadata),
@@ -64,29 +64,31 @@ except ImportError:
 
 logger = logging.getLogger("plugin.smart_segmentation")
 
+# === 运行时全局状态 ===
 _runtime_enabled = True
+
+# 早期路径预分段缓存：key = (stream_id, normalized_response_hash)
+# 由 maisaka.replyer.after_response hook 写入，由 send_service.after_build_message 消费
+_prepared_segment_registry: dict[tuple[str, str], dict[str, Any]] = {}
+_PREPARED_SEGMENT_TTL_SECONDS = 60.0
+
+# 首段直发后，剩余分段在 after_send 阶段补发
 _pending_follow_up_segments: dict[str, dict[str, Any]] = {}
+_PENDING_FOLLOW_UP_TTL_SECONDS = 60.0
+
+# 插件自身补发时关闭二次分段
 _stream_resend_guards: dict[str, int] = {}
+
+# 命令执行期间禁止把命令回执误判为主回复
 _active_command_streams: dict[str, int] = {}
 _recent_command_stream_expiries: dict[str, float] = {}
-_SEGMENT_DELIMITER = "|||SPLIT|||"
-_PREPARED_SEGMENTS_MARKER = "[smart_segmentation_plugin:segments]"
-_PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY = "smart_segmentation_prepared_segments"
-_REPLYER_SEGMENT_MARKERS = (
-    "[smart_segmentation_plugin:replyer]",
-    "[replyer]",
-)
-_DIAGNOSTIC_OUTBOUND_TEXT_PATTERNS = (
-    re.compile(r"^(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\b"),
-    re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\b"),
-    re.compile(r"^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b"),
-    re.compile(r"^Traceback \(most recent call last\):"),
-)
-_AFTER_BUILD_FALLBACK_SEGMENT_TIMEOUT_SECONDS = 8.0
-# 命令回执的同步发送链路已被 _active_command_streams 精确覆盖，这里的窗口只用来兜住
-# 命令 hook 与 send_service 之间可能存在的轻微异步抖动（毫秒到秒级），过长会把命令后的
-# 正常业务主回复一起误伤——曾出现 90s 窗口导致重启后首个 @ 回复不分段的问题。
-_COMMAND_REPLY_GRACE_SECONDS = 2.0
+# 仅兜住命令 hook 与 send_service 之间的轻微异步抖动。值过大会把命令后紧跟的正常主回复一起误伤
+# (旧 90s 窗口就出现过重启后首个 @ 回复不分段的回归)，1.0s 已经足够覆盖 IPC 微抖动，
+# 同时把误伤窗口比之前的 2.0s 缩短一半。
+_COMMAND_REPLY_GRACE_SECONDS = 1.0
+
+# maisaka 早期路径自己的 LLM 超时；这是当前唯一会做分段 LLM 调用的入口。
+_REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS = 12.0
 
 
 class _PinnedTaskLLMOrchestrator(LLMOrchestrator):
@@ -158,19 +160,45 @@ def _find_host_model_config_path() -> str:
     return os.path.join(host_root, "config", "model_config.toml")
 
 
+# === mtime 缓存：避免每个 hook 都同步读盘 ===
+
+_host_model_config_cache: dict[str, Any] = {}
+_host_model_config_cache_mtime: float | None = None
+
+_local_plugin_config_cache: dict[str, Any] = {}
+_local_plugin_config_cache_mtime: float | None = None
+
+
 def _load_host_model_config_fallback() -> dict[str, Any]:
-    """回退读取宿主 model_config.toml，用于把底层模型名映射到 task 名。"""
+    """回退读取宿主 model_config.toml；按 mtime 缓存，文件未变就走内存。"""
+    global _host_model_config_cache, _host_model_config_cache_mtime
+
     model_config_path = _find_host_model_config_path()
     if not os.path.isfile(model_config_path):
         return {}
 
     try:
+        mtime = os.path.getmtime(model_config_path)
+    except OSError as exc:
+        logger.warning("读取宿主 model_config.toml mtime 失败: %s", exc)
+        return _host_model_config_cache
+
+    if _host_model_config_cache_mtime == mtime and _host_model_config_cache:
+        return _host_model_config_cache
+
+    try:
         with open(model_config_path, "rb") as config_file:
             config_data = tomllib.load(config_file)
-        return config_data if isinstance(config_data, dict) else {}
     except (OSError, tomllib.TOMLDecodeError) as exc:
         logger.warning("读取宿主 model_config.toml 失败，无法做模型名映射: %s", exc)
+        return _host_model_config_cache
+
+    if not isinstance(config_data, dict):
         return {}
+
+    _host_model_config_cache = config_data
+    _host_model_config_cache_mtime = mtime
+    return _host_model_config_cache
 
 
 def _normalize_model_alias_candidates(configured_name: str, host_model_config: dict[str, Any]) -> list[str]:
@@ -253,118 +281,64 @@ def _extract_json_array_text(raw_text: str) -> str:
     return result_text
 
 
-def _encode_prepared_segments(segments: list[str]) -> str:
-    """将已分好的主回复编码为内部传递文本。"""
-    return _SEGMENT_DELIMITER.join(segment.strip() for segment in segments if segment.strip())
+# === 预分段缓存 ===
 
-
-def _decode_prepared_segments(text: str) -> list[str]:
-    """从内部传递文本中提取已准备好的分段。"""
-    if _SEGMENT_DELIMITER not in text:
-        return []
-    return [segment.strip() for segment in text.split(_SEGMENT_DELIMITER) if segment.strip()]
-
-
-def _build_prepared_segments_marker_text(segments: list[str]) -> str:
-    """构建带有插件标记的预分段文本。"""
-    encoded_segments = _encode_prepared_segments(segments)
-    if not encoded_segments:
+def _normalize_response_text_for_key(text: str) -> str:
+    """归一化用于查找预分段缓存的文本：剥 thinking + 折叠所有空白。"""
+    cleaned = _strip_thinking_content(str(text or ""))
+    if not cleaned:
         return ""
-    return f"{_PREPARED_SEGMENTS_MARKER}{encoded_segments}"
+    return " ".join(cleaned.split())
 
 
-def _get_top_level_additional_data(message: dict[str, Any]) -> dict[str, Any]:
-    """提取事件消息上的 additional_data。"""
-    additional_data = message.get("additional_data")
-    if not isinstance(additional_data, dict):
-        return {}
-    return additional_data
+def _hash_normalized_text(text: str) -> str:
+    """对归一化后的文本做稳定哈希；空文本返回空串。"""
+    normalized = _normalize_response_text_for_key(text)
+    if not normalized:
+        return ""
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
 
 
-def _inject_prepared_segments_into_message(message: dict[str, Any], segments: list[str]) -> None:
-    """将预分段结果同时写入文本标记与 additional_data，避免后续链路改写正文后丢失。"""
-    encoded_segments = _encode_prepared_segments(segments)
-    if not encoded_segments:
+def _prune_expired_prepared_segments() -> None:
+    """清理早期路径预分段缓存里所有已超时的条目。"""
+    if not _prepared_segment_registry:
         return
-
-    marked_text = f"{_PREPARED_SEGMENTS_MARKER}{encoded_segments}"
-    message["llm_response_content"] = marked_text
-
-    additional_data = message.get("additional_data")
-    if not isinstance(additional_data, dict):
-        additional_data = {}
-        message["additional_data"] = additional_data
-    additional_data[_PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY] = encoded_segments
-
-    message_info = message.get("message_info")
-    if not isinstance(message_info, dict):
-        message_info = {}
-        message["message_info"] = message_info
-    additional_config = message_info.get("additional_config")
-    if not isinstance(additional_config, dict):
-        additional_config = {}
-        message_info["additional_config"] = additional_config
-    additional_config[_PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY] = encoded_segments
+    now = time.monotonic()
+    expired_keys = [k for k, v in _prepared_segment_registry.items() if v.get("expires_at", 0.0) <= now]
+    for key in expired_keys:
+        _prepared_segment_registry.pop(key, None)
 
 
-def _extract_marked_segments(text: str) -> tuple[list[str], str]:
-    """从标记文本中解码分段，返回分段列表与命中的标记来源。"""
-    normalized_text = str(text or "").strip()
-    if not normalized_text:
-        return [], ""
+def _store_prepared_segments(stream_id: str, response_text: str, segments: list[str]) -> bool:
+    """登记早期路径预分段；返回是否成功登记。"""
+    normalized_stream_id = str(stream_id or "").strip()
+    text_hash = _hash_normalized_text(response_text)
+    if not normalized_stream_id or not text_hash or not segments:
+        return False
 
-    if normalized_text.startswith(_PREPARED_SEGMENTS_MARKER):
-        payload = normalized_text[len(_PREPARED_SEGMENTS_MARKER) :].strip()
-        segments = _decode_prepared_segments(payload)
-        return segments, "prepared" if segments else ""
-
-    for marker in _REPLYER_SEGMENT_MARKERS:
-        if normalized_text.startswith(marker):
-            payload = normalized_text[len(marker) :].strip()
-            segments = _decode_prepared_segments(payload)
-            return segments, "replyer" if segments else ""
-
-    replyer_match = re.match(r"^\[replyer(?::[^\]]*)?\](.+)$", normalized_text, flags=re.IGNORECASE | re.DOTALL)
-    if replyer_match:
-        segments = _decode_prepared_segments(replyer_match.group(1).strip())
-        return segments, "replyer" if segments else ""
-
-    return [], ""
+    _prune_expired_prepared_segments()
+    _prepared_segment_registry[(normalized_stream_id, text_hash)] = {
+        "segments": list(segments),
+        "expires_at": time.monotonic() + _PREPARED_SEGMENT_TTL_SECONDS,
+    }
+    return True
 
 
-def _extract_prepared_segments_from_outbound_message(
-    message: dict[str, Any],
-    display_message: str = "",
-) -> tuple[list[str], str]:
-    """从发送链消息里提取预分段标记（含 replyer 标记兜底）。"""
-    top_level_additional_data = _get_top_level_additional_data(message)
-    encoded_segments = str(top_level_additional_data.get(_PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY, "") or "").strip()
-    if encoded_segments:
-        segments = _decode_prepared_segments(encoded_segments)
-        if segments:
-            return segments, "additional_data"
+def _pop_prepared_segments(stream_id: str, outbound_text: str) -> list[str] | None:
+    """命中即返回缓存里的分段并移除条目；未命中返回 None。"""
+    _prune_expired_prepared_segments()
+    normalized_stream_id = str(stream_id or "").strip()
+    text_hash = _hash_normalized_text(outbound_text)
+    if not normalized_stream_id or not text_hash:
+        return None
 
-    additional_config = _get_outbound_additional_config(message)
-    encoded_segments = str(additional_config.get(_PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY, "") or "").strip()
-    if encoded_segments:
-        segments = _decode_prepared_segments(encoded_segments)
-        if segments:
-            return segments, "additional_config"
-
-    candidate_texts = [
-        display_message,
-        str(message.get("display_message", "") or ""),
-        str(message.get("processed_plain_text", "") or ""),
-        _extract_plain_text_outbound_message(message, display_message),
-        str(additional_config.get("replyer_display_message", "") or ""),
-        str(additional_config.get("replyer_text", "") or ""),
-        str(additional_config.get("replyer_marker", "") or ""),
-    ]
-    for candidate_text in candidate_texts:
-        segments, source = _extract_marked_segments(candidate_text)
-        if segments:
-            return segments, source
-    return [], ""
+    entry = _prepared_segment_registry.pop((normalized_stream_id, text_hash), None)
+    if entry is None:
+        return None
+    segments = entry.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return None
+    return list(segments)
 
 
 def _normalize_segments(segments: Any, *, max_segments: int) -> list[str]:
@@ -412,11 +386,15 @@ def _is_mention_component_type(component_type: str) -> bool:
     return component_type in {"at", "mention", "mention_bot"}
 
 
-def _extract_plain_text_outbound_message(message: dict[str, Any], display_message: str = "") -> str:
-    """从发送链消息中提取可安全分段的纯文本。"""
+def _extract_plain_text_outbound_message(message: dict[str, Any], processed_plain_text: str = "") -> str:
+    """从发送链消息中提取可安全分段的纯文本。
+
+    宿主在 ``send_service.after_build_message`` Hook 里实际传入的参数名是
+    ``processed_plain_text``；该参数仅作 raw_message 解析失败时的兜底回填。
+    """
     raw_components = message.get("raw_message")
     if not isinstance(raw_components, list):
-        return str(display_message or "").strip()
+        return str(processed_plain_text or "").strip()
 
     parts: list[str] = []
     for component in raw_components:
@@ -446,7 +424,7 @@ def _extract_plain_text_outbound_message(message: dict[str, Any], display_messag
     text = "".join(parts).strip()
     if text:
         return text
-    return str(display_message or "").strip()
+    return str(processed_plain_text or "").strip()
 
 
 def _clone_message_component(component: dict[str, Any]) -> dict[str, Any]:
@@ -502,76 +480,15 @@ def _replace_outbound_text(message: dict[str, Any], new_text: str) -> dict[str, 
     updated_message = dict(message)
     updated_message["raw_message"] = _build_replaced_outbound_raw_message(message, new_text)
     updated_message["processed_plain_text"] = new_text
+    # SessionMessage 字段里并没有 display_message，这里写一份只是方便调试/兼容旧链路读取。
     updated_message["display_message"] = new_text
     message_info = updated_message.get("message_info")
     if isinstance(message_info, dict):
         updated_message["message_info"] = dict(message_info)
-        additional_config = message_info.get("additional_config")
-        if isinstance(additional_config, dict):
-            sanitized_additional_config = dict(additional_config)
-            sanitized_additional_config.pop(_PREPARED_SEGMENTS_ADDITIONAL_CONFIG_KEY, None)
-            updated_message["message_info"]["additional_config"] = sanitized_additional_config
     return updated_message
 
 
-def _get_outbound_additional_config(message: dict[str, Any]) -> dict[str, Any]:
-    """提取出站消息 additional_config。"""
-    message_info = message.get("message_info")
-    if not isinstance(message_info, dict):
-        return {}
-
-    additional_config = message_info.get("additional_config")
-    if not isinstance(additional_config, dict):
-        return {}
-    return additional_config
-
-
-def _looks_like_diagnostic_outbound_text(text: str) -> bool:
-    """识别日志/诊断文本，避免把宿主或插件输出误判成主回复。"""
-    normalized_text = " ".join(str(text or "").split())
-    if not normalized_text:
-        return False
-    return any(pattern.search(normalized_text) for pattern in _DIAGNOSTIC_OUTBOUND_TEXT_PATTERNS)
-
-
-def _should_apply_after_build_fallback(
-    message: dict[str, Any],
-    display_message: str = "",
-    *,
-    storage_message: bool = True,
-) -> bool:
-    """仅对可确认属于 bot 主回复的出站消息启用发送前兜底分段。"""
-    additional_config = _get_outbound_additional_config(message)
-
-    selected_expressions = additional_config.get("selected_expressions")
-    if isinstance(selected_expressions, list) and selected_expressions:
-        return True
-
-    reply_to = str(message.get("reply_to", "") or "").strip()
-    if reply_to:
-        return True
-
-    for marker_key in ("replyer_display_message", "replyer_text", "replyer_marker"):
-        marker_value = str(additional_config.get(marker_key, "") or "").strip()
-        if marker_value:
-            return True
-
-    # 大量插件命令帮助/进度/报错文本会显式标记为不入库，
-    # 这类主动输出不应参与智能分段。
-    if not storage_message:
-        return False
-
-    outbound_text = _strip_thinking_content(_extract_plain_text_outbound_message(message, display_message))
-    if not outbound_text:
-        return False
-
-    if _looks_like_diagnostic_outbound_text(outbound_text):
-        return False
-
-    # Maisaka reply 会先走宿主回复后处理，再直接把纯文本送入 send_service。
-    # 这条链路下经常没有 reply_to / selected_expressions，但它依然是真正的 bot 主回复。
-    return True
-
+# === 待补发分段 ===
 
 def _normalize_pending_lookup_keys(*keys: Any) -> list[str]:
     """规范化待补发分段的查找键，并去重。"""
@@ -594,10 +511,36 @@ def _build_follow_up_tracking_key(*, stream_id: str, timestamp: Any, visible_tex
     return "\x1f".join((normalized_stream_id, normalized_timestamp, normalized_text))
 
 
+def _prune_expired_pending_follow_up() -> None:
+    """清理 pending 注册表里超时未消费的条目，避免 send 失败时常驻内存。"""
+    if not _pending_follow_up_segments:
+        return
+    now = time.monotonic()
+    expired_keys: list[str] = []
+    seen_owners: set[int] = set()
+    for lookup_key, pending_data in list(_pending_follow_up_segments.items()):
+        if id(pending_data) in seen_owners:
+            continue
+        seen_owners.add(id(pending_data))
+        if pending_data.get("expires_at", 0.0) > now:
+            continue
+        raw_cleanup_keys = pending_data.get("lookup_keys")
+        cleanup_keys = (
+            _normalize_pending_lookup_keys(*raw_cleanup_keys)
+            if isinstance(raw_cleanup_keys, list)
+            else [lookup_key]
+        )
+        expired_keys.extend(cleanup_keys)
+    for key in expired_keys:
+        _pending_follow_up_segments.pop(key, None)
+
+
 def _register_pending_follow_up_segments(*, lookup_keys: list[str], pending_data: dict[str, Any]) -> None:
     """用多种查找键登记待补发的分段消息。"""
+    _prune_expired_pending_follow_up()
     tracked_pending_data = dict(pending_data)
     tracked_pending_data["lookup_keys"] = list(lookup_keys)
+    tracked_pending_data.setdefault("expires_at", time.monotonic() + _PENDING_FOLLOW_UP_TTL_SECONDS)
     for lookup_key in lookup_keys:
         _pending_follow_up_segments[lookup_key] = tracked_pending_data
 
@@ -640,6 +583,8 @@ def _resolve_pending_follow_up_segments(*, message_id: Any, tracking_key: Any) -
 
     return None
 
+
+# === 命令保护窗口 ===
 
 def _mark_command_stream_active(stream_id: Any) -> None:
     """标记当前聊天流正在执行命令。"""
@@ -765,6 +710,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         """处理插件加载。"""
+        _prepared_segment_registry.clear()
         _pending_follow_up_segments.clear()
         _stream_resend_guards.clear()
         _active_command_streams.clear()
@@ -774,24 +720,42 @@ class SmartSegmentationPlugin(MaiBotPlugin):
 
     async def on_unload(self) -> None:
         """处理插件卸载。"""
+        _prepared_segment_registry.clear()
         _pending_follow_up_segments.clear()
         _stream_resend_guards.clear()
         _active_command_streams.clear()
         _recent_command_stream_expiries.clear()
 
     def _load_local_config_fallback(self) -> dict[str, Any]:
-        """回退读取插件目录下的 `config.toml`。"""
+        """回退读取插件目录下的 `config.toml`，按 mtime 缓存。"""
+        global _local_plugin_config_cache, _local_plugin_config_cache_mtime
+
         config_path = os.path.join(os.path.dirname(__file__), "config.toml")
         if not os.path.isfile(config_path):
             return {}
 
         try:
+            mtime = os.path.getmtime(config_path)
+        except OSError as exc:
+            logger.warning("读取插件 config.toml mtime 失败: %s", exc)
+            return _local_plugin_config_cache
+
+        if _local_plugin_config_cache_mtime == mtime and _local_plugin_config_cache:
+            return _local_plugin_config_cache
+
+        try:
             with open(config_path, "rb") as config_file:
                 config_data = tomllib.load(config_file)
-            return config_data if isinstance(config_data, dict) else {}
         except (OSError, tomllib.TOMLDecodeError) as exc:
             logger.error("读取插件配置失败: %s", exc)
+            return _local_plugin_config_cache
+
+        if not isinstance(config_data, dict):
             return {}
+
+        _local_plugin_config_cache = config_data
+        _local_plugin_config_cache_mtime = mtime
+        return _local_plugin_config_cache
 
     async def _get_plugin_config(self) -> dict[str, Any]:
         """获取插件完整配置。"""
@@ -1095,60 +1059,70 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             "delay_max": delay_max,
         }
 
-    @EventHandler(
-        "smart_segmentation_after_llm",
-        description="在 AFTER_LLM 阶段预切分主回复并写入分段标记",
-        event_type=EventType.AFTER_LLM,
-        intercept_message=True,
-        weight=120,
+    @HookHandler(
+        "maisaka.replyer.after_response",
+        name="smart_segmentation_after_replyer_response",
+        description="在 Maisaka replyer 拿到模型回复后立刻预分段，把结果登记到进程内缓存，发送链可零 LLM 调用直接消费",
     )
-    async def handle_smart_segmentation_after_llm(
+    async def handle_maisaka_replyer_after_response(
         self,
-        message: dict[str, Any] | None = None,
+        response: str = "",
+        session_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """在 AFTER_LLM 阶段提前分段，仅写入内部标记。"""
+        """早期路径预分段：发送链上不再做同步 LLM 调用。"""
         del kwargs
 
-        if not isinstance(message, dict):
-            return {"continue_processing": True}
+        if not _runtime_enabled:
+            return {"action": "continue"}
+
+        normalized_stream_id = str(session_id or "").strip()
+        normalized_response = str(response or "").strip()
+        if not normalized_stream_id or not normalized_response:
+            return {"action": "continue"}
+
+        # 命令期间产生的 LLM 回复极少见，但若发生就跟随发送链上同样的策略跳过。
+        if _is_command_stream_active(normalized_stream_id):
+            return {"action": "continue"}
 
         settings = await self._get_segmentation_runtime_settings()
         if settings is None:
-            return {"continue_processing": True}
+            return {"action": "continue"}
 
-        response_content = str(message.get("llm_response_content", "") or "").strip()
-        if not response_content:
-            return {"continue_processing": True}
-
-        if response_content.startswith(_PREPARED_SEGMENTS_MARKER):
-            return {"continue_processing": True}
-
-        visible_text = _strip_thinking_content(response_content)
+        visible_text = _strip_thinking_content(normalized_response)
         if not visible_text or len(visible_text) < settings["min_length"]:
-            return {"continue_processing": True}
+            return {"action": "continue"}
 
-        segments = await self._segment_text(
-            visible_text,
-            style=settings["style"],
-            model_name=settings["model_name"],
-            max_segments=settings["max_segments"],
-            temperature=settings["temperature"],
-            max_tokens=settings["max_tokens"],
-        )
+        try:
+            segments = await asyncio.wait_for(
+                self._segment_text(
+                    visible_text,
+                    style=settings["style"],
+                    model_name=settings["model_name"],
+                    max_segments=settings["max_segments"],
+                    temperature=settings["temperature"],
+                    max_tokens=settings["max_tokens"],
+                ),
+                timeout=_REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "智能分段在 replyer.after_response 阶段超时（> %.2fs），发送前还会再尝试一次",
+                _REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS,
+            )
+            return {"action": "continue"}
+
         if not segments or len(segments) <= 1:
-            return {"continue_processing": True}
+            return {"action": "continue"}
 
-        marked_text = _build_prepared_segments_marker_text(segments)
-        if not marked_text:
-            return {"continue_processing": True}
-
-        _inject_prepared_segments_into_message(message, segments)
-        logger.info("智能分段预切分完成，已写入分段标记，共 %s 段", len(segments))
-        return {
-            "continue_processing": True,
-            "modified_message": message,
-        }
+        # 缓存按归一化后的原文 hash 索引；后续 after_build_message 用同样规则做查找。
+        if _store_prepared_segments(normalized_stream_id, normalized_response, segments):
+            logger.info(
+                "智能分段已在 replyer.after_response 阶段预切分，共 %s 段，已登记到缓存 stream=%s",
+                len(segments),
+                normalized_stream_id,
+            )
+        return {"action": "continue"}
 
     @HookHandler(
         "chat.command.before_execute",
@@ -1187,20 +1161,28 @@ class SmartSegmentationPlugin(MaiBotPlugin):
     @HookHandler(
         "send_service.after_build_message",
         name="smart_segmentation_after_build",
-        description="在发送前消费预分段标记，首段保留原始发送链路",
+        description="只消费 replyer.after_response 阶段登记的预分段缓存，不再做任何发送前兜底 LLM 调用",
     )
     async def handle_smart_segmentation_after_build(
         self,
         message: dict[str, Any] | None = None,
         stream_id: str = "",
+        processed_plain_text: str = "",
         display_message: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """在发送前改写首段，并登记后续待补发的分段。"""
+        """仅消费 maisaka.replyer.after_response 阶段的预分段缓存。
+
+        宿主在 ``send_service.after_build_message`` 实际传入的是 ``processed_plain_text``，
+        旧测试里以 ``display_message`` 调用的链路同样保留兼容。
+        缓存的唯一写入者是 ``maisaka.replyer.after_response``，
+        这是判定"该消息是否来自回复模型"的唯一可靠信号；其他链路（命令回执、
+        memory/expression/插件 ctx.send.text 等）永远不会进缓存，因此自动跳过。
+        """
         updated_kwargs = dict(kwargs)
         updated_kwargs["message"] = message
         updated_kwargs["stream_id"] = stream_id
-        updated_kwargs["display_message"] = display_message
+        updated_kwargs["processed_plain_text"] = processed_plain_text or display_message
 
         if not isinstance(message, dict):
             return {"action": "continue"}
@@ -1210,61 +1192,28 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             return {"action": "continue"}
 
         if _is_command_stream_active(normalized_stream_id):
-            logger.debug("智能分段跳过发送前兜底：当前聊天流正在执行命令")
+            logger.debug("智能分段跳过：当前聊天流正在执行命令")
             return {"action": "continue"}
         grace_remaining = _get_command_stream_grace_remaining(normalized_stream_id)
         if grace_remaining is not None:
-            logger.info(
-                "智能分段跳过发送前兜底：当前聊天流处于命令回执保护窗口，剩余 %.2fs",
+            logger.debug(
+                "智能分段跳过：聊天流处于命令回执保护窗口，剩余 %.2fs",
                 grace_remaining,
             )
+            return {"action": "continue"}
+
+        outbound_text_hint = processed_plain_text or display_message
+        outbound_text = _strip_thinking_content(_extract_plain_text_outbound_message(message, outbound_text_hint))
+
+        cached_segments = _pop_prepared_segments(normalized_stream_id, outbound_text)
+        if not cached_segments or len(cached_segments) <= 1:
             return {"action": "continue"}
 
         settings = await self._get_segmentation_runtime_settings()
         if settings is None:
             return {"action": "continue"}
 
-        segments, marker_source = _extract_prepared_segments_from_outbound_message(message, display_message)
-        if not segments or len(segments) <= 1:
-            if not _should_apply_after_build_fallback(
-                message,
-                display_message,
-                storage_message=bool(updated_kwargs.get("storage_message", True)),
-            ):
-                logger.debug("智能分段跳过发送前兜底：当前消息不满足兜底条件")
-                return {"action": "continue"}
-
-            outbound_text = _strip_thinking_content(_extract_plain_text_outbound_message(message, display_message))
-            if not outbound_text or len(outbound_text) < settings["min_length"]:
-                logger.debug(
-                    "智能分段跳过发送前兜底：文本为空或长度不足，length=%s min_length=%s",
-                    len(outbound_text),
-                    settings["min_length"],
-                )
-                return {"action": "continue"}
-
-            try:
-                segments = await asyncio.wait_for(
-                    self._segment_text(
-                        outbound_text,
-                        style=settings["style"],
-                        model_name=settings["model_name"],
-                        max_segments=settings["max_segments"],
-                        temperature=settings["temperature"],
-                        max_tokens=settings["max_tokens"],
-                    ),
-                    timeout=_AFTER_BUILD_FALLBACK_SEGMENT_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "智能分段发送前兜底超时（> %.2fs），本次保留原消息直接发送",
-                    _AFTER_BUILD_FALLBACK_SEGMENT_TIMEOUT_SECONDS,
-                )
-                return {"action": "continue"}
-            if not segments or len(segments) <= 1:
-                return {"action": "continue"}
-            marker_source = "after_build_fallback"
-
+        segments = cached_segments
         first_segment = segments[0]
         follow_up_segments = segments[1:]
         message_id = str(message.get("message_id", "") or "").strip()
@@ -1279,7 +1228,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
 
         updated_message = _replace_outbound_text(message, first_segment)
         updated_kwargs["message"] = updated_message
-        updated_kwargs["display_message"] = first_segment
+        updated_kwargs["processed_plain_text"] = first_segment
 
         _register_pending_follow_up_segments(
             lookup_keys=lookup_keys,
@@ -1291,16 +1240,11 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                 "delay_max": settings["delay_max"],
             },
         )
-        if marker_source == "replyer":
-            logger.info("智能分段已从 replyer 兜底标记恢复，原始发送保留首段并登记 %s 条补发消息", len(follow_up_segments))
-        elif marker_source == "additional_data":
-            logger.info("智能分段已从 additional_data 恢复预分段，原始发送保留首段并登记 %s 条补发消息", len(follow_up_segments))
-        elif marker_source == "additional_config":
-            logger.info("智能分段已从 additional_config 恢复预分段，原始发送保留首段并登记 %s 条补发消息", len(follow_up_segments))
-        elif marker_source == "after_build_fallback":
-            logger.info("智能分段已在发送前直接分段，原始发送保留首段并登记 %s 条补发消息", len(follow_up_segments))
-        else:
-            logger.info("智能分段已消费预分段标记，原始发送保留首段并登记 %s 条补发消息", len(follow_up_segments))
+        logger.info(
+            "智能分段命中 replyer 预分段缓存，首段直发，登记 %s 条补发消息 stream=%s",
+            len(follow_up_segments),
+            normalized_stream_id,
+        )
         return {"action": "continue", "modified_kwargs": updated_kwargs}
 
     @HookHandler(

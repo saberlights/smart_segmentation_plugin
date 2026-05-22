@@ -117,13 +117,12 @@ delay_max = 1.2
 
 ## 工作流程
 
-1. 在 `AFTER_LLM` 阶段拿到主回复文本
-2. 调用 LLM 生成分段结果，并把结果写入内部标记
-3. 在 `send_service.after_build_message` 阶段把首段替换进原消息
-4. 在 `send_service.after_send` 阶段按延迟补发剩余段落
-5. 使用重入保护，避免插件自己补发的消息再次被切分
+1. 在 `maisaka.replyer.after_response` 阶段拿到回复模型刚出的回复文本后立刻调用分段 LLM 切分，并把结果登记到一份 `(stream_id, 归一化文本 hash) -> [分段]` 的进程内缓存（默认 60 秒 TTL）
+2. 在 `send_service.after_build_message` 阶段只按 `(stream_id, 出站文本 hash)` 去缓存里找；命中即零 LLM 调用、首段替换原消息后直接发送；**未命中直接放行原消息，发送链上不会再做任何 LLM 兜底**
+3. 在 `send_service.after_send` 阶段按延迟节奏补发剩余段落
+4. 使用重入保护，避免插件自己补发的消息再次被切分
 
-这种设计的好处是：首条消息仍然走宿主原始发送链路，引用、会话上下文和平台发送行为不会被破坏。
+这种设计的关键点是：**只信任 `maisaka.replyer.after_response` 这一个入口的产出**，因为它是宿主里唯一会在回复模型出文时触发的钩子。其他所有路径（命令回执、memory 模块文本、expression 模块广播、其他插件 `ctx.send.text` 的输出）都不会进入缓存，因此完全不会被错误地切碎。首条消息仍然走宿主原始发送链路，引用、会话上下文和平台发送行为不会被破坏；并且发送链上没有同步 LLM 调用，慢模型不会再静默吃掉分段。
 
 ## 故障排查
 
@@ -134,7 +133,9 @@ delay_max = 1.2
 1. `config.toml` 里 `plugin.enabled = true`
 2. `config.toml` 里 `segmentation.enabled = true`
 3. 宿主 `config/bot_config.toml` 里 `response_splitter.enable = false`
-4. 日志中是否出现智能分段开始、完成或消费预分段标记的记录
+4. 日志中是否出现 `replyer.after_response 阶段预切分` 或 `命中 replyer 预分段缓存` 的记录
+5. 如果只看到 `跳过：聊天流处于命令回执保护窗口`，说明 bot 刚执行完一条命令，命令后 1 秒内的回复会跳过分段
+6. 如果回复模型出文没经过 `maisaka.replyer.after_response`（例如走了非 maisaka 的回复路径），插件会**直接放行原消息不分段** —— 这是设计如此，避免对非回复模型的输出（命令回执、memory/expression 文本等）误分段
 
 ### 切得太碎或太密
 
