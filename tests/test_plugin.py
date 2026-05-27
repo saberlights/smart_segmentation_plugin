@@ -1,7 +1,7 @@
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -11,12 +11,17 @@ from plugins.smart_segmentation_plugin.plugin import (
     SmartSegmentationPlugin,
     _extract_plain_text_outbound_message,
     _get_command_stream_grace_remaining,
+    _has_unbalanced_brackets,
     _hash_normalized_text,
+    _is_action_only_text,
     _is_command_stream_active,
     _mark_command_stream_active,
     _mark_command_stream_inactive,
+    _merge_segments_balancing_brackets,
     _pop_prepared_segments,
     _replace_outbound_text,
+    _split_segments_at_bracket_boundaries,
+    _split_text_at_brackets,
     _store_prepared_segments,
 )
 
@@ -233,6 +238,39 @@ def test_after_send_uses_visible_first_segment_when_reply_component_rewrites_pro
         assert not plugin_module._pending_follow_up_segments
     finally:
         _reset_global_state()
+
+
+def test_send_segments_marks_follow_ups_for_maisaka_history_sync() -> None:
+    """补发的分段必须显式声明 sync_to_maisaka_history，否则 maisaka 历史
+    只会留下首段，下一轮规划器会把剩余内容彻底丢掉（实战中表现为：分段后的
+    回复"等下让我想想，感觉后面那个是聞かせて？……" 只剩下"等下让我想想"
+    被记入历史）。"""
+    plugin = SmartSegmentationPlugin()
+    send_text_mock = AsyncMock(return_value=True)
+    mock_ctx = MagicMock()
+    mock_ctx.send = MagicMock()
+    mock_ctx.send.text = send_text_mock
+    # ctx 是只读 property，运行时由 Runner 注入；测试里直接打到下层 _ctx
+    plugin._ctx = mock_ctx
+
+    with patch.object(plugin_module.asyncio, "sleep", AsyncMock()):
+        ok = asyncio.run(
+            plugin._send_segments(
+                "stream-history",
+                ["第二段", "第三段"],
+                delay_base=0.1,
+                delay_per_char=0.2,
+                delay_max=0.3,
+                delay_before_first=True,
+            )
+        )
+
+    assert ok is True
+    assert send_text_mock.await_count == 2
+    for call in send_text_mock.await_args_list:
+        # ctx.send.text(segment, stream_id, sync_to_maisaka_history=True, maisaka_source_kind="guided_reply")
+        assert call.kwargs.get("sync_to_maisaka_history") is True
+        assert call.kwargs.get("maisaka_source_kind") == "guided_reply"
 
 
 def test_after_build_skips_when_no_prepared_cache_hit() -> None:
@@ -583,3 +621,211 @@ def test_grace_window_remaining_expires_without_renewal() -> None:
         assert stream_id not in plugin_module._recent_command_stream_expiries
     finally:
         _reset_global_state()
+
+
+def test_is_action_only_text_detects_full_wrap_brackets() -> None:
+    # 全角动作描述：常见的角色扮演旁白
+    assert _is_action_only_text("（理理缓缓起身）")
+    assert _is_action_only_text("  （理理缓缓起身）  ")
+    # 半角括号同样视为动作描述
+    assert _is_action_only_text("(walks slowly toward the window)")
+    # 中文方括号也算
+    assert _is_action_only_text("【动作：理理朝你挥了挥手】")
+    # 嵌套括号仍然算"整段"
+    assert _is_action_only_text("（理理（轻声）说道）")
+
+
+def test_is_action_only_text_rejects_mixed_content() -> None:
+    # 括号外还有正文，不算纯括号
+    assert not _is_action_only_text("你好啊（理理挥手）")
+    assert not _is_action_only_text("（理理挥手）你好啊")
+    # 中间断开（先闭再开）不算整段一对包裹
+    assert not _is_action_only_text("（前半）（后半）")
+    # 单边括号
+    assert not _is_action_only_text("（理理缓缓起身")
+    assert not _is_action_only_text("理理缓缓起身）")
+    # 空文本
+    assert not _is_action_only_text("")
+    assert not _is_action_only_text("   ")
+
+
+def test_has_unbalanced_brackets_detects_missing_pair() -> None:
+    assert _has_unbalanced_brackets("（理理")
+    assert _has_unbalanced_brackets("理理）")
+    assert _has_unbalanced_brackets("a (b")
+    assert not _has_unbalanced_brackets("（理理缓缓起身）")
+    assert not _has_unbalanced_brackets("a (b) c")
+    assert not _has_unbalanced_brackets("")
+
+
+def test_merge_segments_balancing_brackets_joins_split_action() -> None:
+    # 模型把"（理理缓缓起身）"切成了两段，应该合回单段
+    assert _merge_segments_balancing_brackets(["你好啊（理理", "缓缓起身）今天怎么样"]) == [
+        "你好啊（理理缓缓起身）今天怎么样",
+    ]
+    # 跨多段也要合并到括号闭合为止
+    assert _merge_segments_balancing_brackets(["a（b", "c", "d）e"]) == ["a（bcd）e"]
+    # 已经平衡的分段保持不变
+    assert _merge_segments_balancing_brackets(["你好啊", "今天怎么样"]) == ["你好啊", "今天怎么样"]
+    # 含完整括号的段不影响后续分段
+    assert _merge_segments_balancing_brackets(["你好啊（理理挥手）", "今天怎么样"]) == [
+        "你好啊（理理挥手）",
+        "今天怎么样",
+    ]
+    # 原文里就缺一半括号时，剩余 buffer 仍要原样吐出，不能吞段
+    assert _merge_segments_balancing_brackets(["a（b", "c"]) == ["a（bc"]
+
+
+def test_segment_text_splits_brackets_into_independent_segments() -> None:
+    """_segment_text 应该把括号包裹的动作描述拆成独立段，而不是与正文混在一段。"""
+    plugin = SmartSegmentationPlugin()
+    # 模型返回单段未拆分；插件后处理负责按括号边界拆出动作描述
+    fake_llm_result = {
+        "success": True,
+        "response": '["你好啊（理理缓缓起身）今天怎么样"]',
+        "model_name": "test-model",
+    }
+
+    async def fake_resolve(_configured_name: str) -> tuple[str, str]:
+        return ("task", "")
+
+    # SDK 里 ctx 是只读 property，没法直接 patch.object；这里走内部 _ctx 注入。
+    ctx_mock = MagicMock()
+    ctx_mock.llm.generate = AsyncMock(return_value=fake_llm_result)
+    plugin._ctx = ctx_mock
+
+    with patch.object(plugin, "_resolve_generation_model", side_effect=fake_resolve):
+        segments = asyncio.run(
+            plugin._segment_text(
+                "你好啊（理理缓缓起身）今天怎么样",
+                style="natural",
+                model_name="",
+                max_segments=8,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+
+    assert segments == ["你好啊", "（理理缓缓起身）", "今天怎么样"]
+
+
+def test_segment_text_recovers_when_model_splits_brackets() -> None:
+    """模型把括号切错（断在括号中间）时，先合并再按括号边界拆出独立段。"""
+    plugin = SmartSegmentationPlugin()
+    fake_llm_result = {
+        "success": True,
+        "response": '["你好啊（理理", "缓缓起身）今天怎么样"]',
+        "model_name": "test-model",
+    }
+
+    async def fake_resolve(_configured_name: str) -> tuple[str, str]:
+        return ("task", "")
+
+    ctx_mock = MagicMock()
+    ctx_mock.llm.generate = AsyncMock(return_value=fake_llm_result)
+    plugin._ctx = ctx_mock
+
+    with patch.object(plugin, "_resolve_generation_model", side_effect=fake_resolve):
+        segments = asyncio.run(
+            plugin._segment_text(
+                "你好啊（理理缓缓起身）今天怎么样",
+                style="natural",
+                model_name="",
+                max_segments=8,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+
+    assert segments == ["你好啊", "（理理缓缓起身）", "今天怎么样"]
+
+
+def test_split_text_at_brackets_extracts_bracketed_blocks() -> None:
+    assert _split_text_at_brackets("你好啊（理理缓缓起身）今天怎么样") == [
+        "你好啊",
+        "（理理缓缓起身）",
+        "今天怎么样",
+    ]
+    # 起始就是括号
+    assert _split_text_at_brackets("（动作）然后呢") == ["（动作）", "然后呢"]
+    # 末尾就是括号
+    assert _split_text_at_brackets("先讲一下（动作）") == ["先讲一下", "（动作）"]
+    # 多个括号块
+    assert _split_text_at_brackets("a（b）c（d）e") == ["a", "（b）", "c", "（d）", "e"]
+    # 嵌套括号视为一个整块
+    assert _split_text_at_brackets("（外（内）外）") == ["（外（内）外）"]
+    # 没有括号
+    assert _split_text_at_brackets("纯文本没有括号") == ["纯文本没有括号"]
+    # 空文本
+    assert _split_text_at_brackets("") == []
+    # 未闭合的括号不拆，保持原样落入同一段
+    assert _split_text_at_brackets("你好啊（理理") == ["你好啊（理理"]
+
+
+def test_split_segments_at_bracket_boundaries_respects_max_segments() -> None:
+    # 多段都按括号边界拆开，结果是独立段
+    assert _split_segments_at_bracket_boundaries(
+        ["你好啊（动作1）今天好吗", "再见（动作2）"],
+        max_segments=8,
+    ) == ["你好啊", "（动作1）", "今天好吗", "再见", "（动作2）"]
+
+    # max_segments 限制：超出的尾部段合并回最后一段，避免吃掉内容
+    assert _split_segments_at_bracket_boundaries(
+        ["a（b）c（d）e"],
+        max_segments=3,
+    ) == ["a", "（b）", "c（d）e"]
+
+    # 空输入透传
+    assert _split_segments_at_bracket_boundaries([], max_segments=8) == []
+
+    # 没有括号时与输入一致（清掉空白）
+    assert _split_segments_at_bracket_boundaries(
+        ["你好啊", "今天怎么样"],
+        max_segments=8,
+    ) == ["你好啊", "今天怎么样"]
+
+
+def test_maisaka_after_response_skips_action_only_text() -> None:
+    """整段消息就是括号包裹的动作描述时，早期路径应直接跳过，不调用 LLM 分段。"""
+    plugin = SmartSegmentationPlugin()
+    runtime_settings = {
+        "min_length": 8,
+        "max_segments": 8,
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "style": "natural",
+        "model_name": "",
+        "delay_base": 0.35,
+        "delay_per_char": 0.015,
+        "delay_max": 1.2,
+    }
+    segment_text_mock = AsyncMock(return_value=["不应被调用"])
+
+    try:
+        with (
+            patch.object(plugin, "_get_segmentation_runtime_settings", AsyncMock(return_value=runtime_settings)),
+            patch.object(plugin, "_segment_text", segment_text_mock),
+        ):
+            result = asyncio.run(
+                plugin.handle_maisaka_replyer_after_response(
+                    response="（理理缓缓起身，目光柔和地看向窗外的远方）",
+                    session_id="stream-action-only",
+                )
+            )
+
+        assert result == {"action": "continue"}
+        segment_text_mock.assert_not_awaited()
+        assert not plugin_module._prepared_segment_registry
+    finally:
+        _reset_global_state()
+
+
+def test_build_segmentation_prompt_mentions_bracket_rule() -> None:
+    # prompt 必须显式声明括号要独立成段，避免提示词漂移时悄无声息地回归
+    prompt = SmartSegmentationPlugin._build_segmentation_prompt(
+        "你好啊（理理缓缓起身）今天怎么样",
+        style="natural",
+        max_segments=8,
+    )
+    assert "括号" in prompt
+    assert "独立" in prompt

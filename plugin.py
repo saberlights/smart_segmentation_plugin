@@ -281,6 +281,158 @@ def _extract_json_array_text(raw_text: str) -> str:
     return result_text
 
 
+# === 括号识别 ===
+# 同时覆盖中英文括号；角色扮演动作描述常用全角"（）"。
+_BRACKET_PAIRS: tuple[tuple[str, str], ...] = (
+    ("（", "）"),
+    ("(", ")"),
+    ("【", "】"),
+    ("[", "]"),
+)
+
+
+def _is_action_only_text(text: str) -> bool:
+    """判断文本是否整体被一对括号包裹（典型的角色扮演动作/神态描述）。
+
+    用于在分段前直接放行此类消息，避免把"（理理缓缓起身）"这种整段动作描述
+    继续拆开发送。
+    """
+    stripped = str(text or "").strip()
+    if len(stripped) < 2:
+        return False
+
+    for open_bracket, close_bracket in _BRACKET_PAIRS:
+        if not stripped.startswith(open_bracket) or not stripped.endswith(close_bracket):
+            continue
+        depth = 0
+        for index, char in enumerate(stripped):
+            if char == open_bracket:
+                depth += 1
+            elif char == close_bracket:
+                depth -= 1
+                if depth == 0:
+                    # 首个完整闭合点必须正好是末尾字符，否则中间已经先闭合再起新括号。
+                    return index == len(stripped) - 1
+    return False
+
+
+def _has_unbalanced_brackets(text: str) -> bool:
+    """判断文本中是否存在未闭合的括号。"""
+    for open_bracket, close_bracket in _BRACKET_PAIRS:
+        if text.count(open_bracket) != text.count(close_bracket):
+            return True
+    return False
+
+
+def _merge_segments_balancing_brackets(segments: list[str]) -> list[str]:
+    """合并被模型拆到不同段的括号对，保证每段的括号都是平衡的。
+
+    背景：模型偶尔会把"（动作描述）"切到相邻段（如 ["a（理理", "起身）b"]），
+    后续的"按括号边界拆段"必须建立在每段括号成对的前提下，否则会识别不到完整
+    的括号块。这里按括号深度累计扫描，发现累计段还有未闭合的括号就和下一段合
+    并，直到括号闭合。
+    """
+    if not segments:
+        return list(segments)
+
+    merged: list[str] = []
+    buffer = ""
+    for segment in segments:
+        buffer = buffer + segment if buffer else segment
+        if not _has_unbalanced_brackets(buffer):
+            merged.append(buffer)
+            buffer = ""
+
+    if buffer:
+        # 累计完所有段后括号仍未闭合：原文里大概率就缺一半括号，
+        # 直接把剩余 buffer 作为一段输出，保留原文内容不丢失。
+        merged.append(buffer)
+
+    return merged
+
+
+def _split_text_at_brackets(text: str) -> list[str]:
+    """把单段文本按括号边界拆成片段，括号块本身作为独立片段保留。
+
+    例如 ``"你好啊（理理缓缓起身）今天怎么样"`` 会被拆成
+    ``["你好啊", "（理理缓缓起身）", "今天怎么样"]``。
+    """
+    if not text:
+        return []
+
+    parts: list[str] = []
+    buffer: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        matched_pair: tuple[str, str] | None = None
+        for open_bracket, close_bracket in _BRACKET_PAIRS:
+            if char == open_bracket:
+                matched_pair = (open_bracket, close_bracket)
+                break
+
+        if matched_pair is None:
+            buffer.append(char)
+            index += 1
+            continue
+
+        open_bracket, close_bracket = matched_pair
+        depth = 1
+        scan_index = index + 1
+        while scan_index < len(text) and depth > 0:
+            if text[scan_index] == open_bracket:
+                depth += 1
+            elif text[scan_index] == close_bracket:
+                depth -= 1
+            scan_index += 1
+
+        if depth != 0:
+            # 这段括号没有闭合，留给上层的不平衡处理，整体保留不拆。
+            buffer.append(text[index:])
+            index = len(text)
+            break
+
+        if buffer:
+            parts.append("".join(buffer))
+            buffer = []
+        parts.append(text[index:scan_index])
+        index = scan_index
+
+    if buffer:
+        parts.append("".join(buffer))
+
+    return parts
+
+
+def _split_segments_at_bracket_boundaries(segments: list[str], *, max_segments: int) -> list[str]:
+    """把每段内的括号包裹内容拆成独立的消息段。
+
+    场景：括号内的动作/神态描述（如"（理理缓缓起身）"）应该作为单独一条消息发送，
+    而不是和括号外的正文连在一起。最终段数受 ``max_segments`` 限制：超出时把溢出
+    的部分合并回最后一段，避免吃掉内容。
+    """
+    if not segments:
+        return list(segments)
+
+    result: list[str] = []
+    for segment in segments:
+        for part in _split_text_at_brackets(segment):
+            stripped_part = part.strip()
+            if stripped_part:
+                result.append(stripped_part)
+
+    if not result:
+        return result
+
+    if max_segments > 0 and len(result) > max_segments:
+        head = result[: max_segments - 1]
+        # 溢出的分段直接首尾拼接，保留原始字符顺序但不再细分。
+        tail = "".join(result[max_segments - 1 :])
+        result = head + [tail]
+
+    return result
+
+
 # === 预分段缓存 ===
 
 def _normalize_response_text_for_key(text: str) -> str:
@@ -895,6 +1047,9 @@ class SmartSegmentationPlugin(MaiBotPlugin):
 - 保留感叹号、问号、省略号、波浪号等有情绪的标点
 - 不要每个逗号都拆开，相关的内容放在一条里
 - 消息长短可以不均匀
+- 括号（中文「（）」「【】」或英文「()」「[]」）内的内容（动作、神态、旁白等描述）必须作为独立的一条消息单独发送，不要和括号外的正文合在同一条
+- 括号内的内容本身不能再拆开，需保持完整
+- 如果整段内容就是被括号包裹的动作/神态描述，直接整段返回不再切分
 - 最多分成 {max_segments} 条
 - 如果不适合切分，就返回只包含原文的一项数组
 
@@ -968,7 +1123,10 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         try:
             json_text = _extract_json_array_text(response_text)
             segments = json.loads(json_text)
-            return _normalize_segments(segments, max_segments=max_segments)
+            normalized = _normalize_segments(segments, max_segments=max_segments)
+            # 先合并被模型误拆的括号对，确保每段括号成对；再按括号边界把动作描述拆成独立段。
+            balanced = _merge_segments_balancing_brackets(normalized)
+            return _split_segments_at_bracket_boundaries(balanced, max_segments=max_segments)
         except Exception as exc:
             logger.error("解析智能分段结果失败: %s, 原始返回: %r", exc, response_text)
             return None
@@ -994,7 +1152,16 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             if index > 0 or delay_before_first:
                 await asyncio.sleep(self._calculate_send_delay(segment, delay_base, delay_per_char, delay_max))
 
-            send_ok = await self.ctx.send.text(segment, stream_id)
+            # 必须显式声明 sync_to_maisaka_history：cap.send.text 默认是 False，
+            # 不传则补发的分段不会进 maisaka 历史，下一轮规划器只能看到首段，把
+            # 真实回复的剩余内容彻底丢掉。source_kind 与 maisaka 自带的 reply 工具
+            # 保持一致，让 SessionBackedMessage 走 include_reply_components=False 的渲染。
+            send_ok = await self.ctx.send.text(
+                segment,
+                stream_id,
+                sync_to_maisaka_history=True,
+                maisaka_source_kind="guided_reply",
+            )
             if not send_ok:
                 logger.error("发送分段消息失败，第 %s 段: %r", index + 1, segment)
                 return False
@@ -1091,6 +1258,14 @@ class SmartSegmentationPlugin(MaiBotPlugin):
 
         visible_text = _strip_thinking_content(normalized_response)
         if not visible_text or len(visible_text) < settings["min_length"]:
+            return {"action": "continue"}
+
+        # 整段就是括号包裹的动作/神态描述（如"（理理缓缓起身）"），不做任何分段处理
+        if _is_action_only_text(visible_text):
+            logger.debug(
+                "智能分段跳过：整段消息为括号包裹的动作/神态描述，stream=%s",
+                normalized_stream_id,
+            )
             return {"action": "continue"}
 
         try:
