@@ -76,6 +76,16 @@ _PREPARED_SEGMENT_TTL_SECONDS = 60.0
 _pending_follow_up_segments: dict[str, dict[str, Any]] = {}
 _PENDING_FOLLOW_UP_TTL_SECONDS = 60.0
 
+# 后台补发协程的句柄集合。
+# 宿主对 send_service.after_send 这个 hook 强制 5000ms 超时（见
+# src/services/send_service.py 的 default_timeout_ms=5000 与
+# src/plugin_runtime/host/hook_dispatcher.py 里的 asyncio.wait_for），
+# 即便是 OBSERVE 观察型也会被 cancel；如果我们直接在 hook 体里串行补发
+# N 段（每段还要 sleep），到点就会被宿主取消，后半截内容彻底丢失。
+# 解法是让 hook 自己在毫秒级返回，把真正的补发循环丢进 asyncio.create_task
+# 后台执行——子任务和 hook 协程是独立的 Task，父被 cancel 不会连带 cancel 子。
+_active_follow_up_tasks: set["asyncio.Task[Any]"] = set()
+
 # 插件自身补发时关闭二次分段
 _stream_resend_guards: dict[str, int] = {}
 
@@ -736,6 +746,25 @@ def _resolve_pending_follow_up_segments(*, message_id: Any, tracking_key: Any) -
     return None
 
 
+# === 后台补发任务 ===
+
+def _track_follow_up_task(task: "asyncio.Task[Any]") -> None:
+    """登记后台补发任务并在结束时自动摘除。
+
+    必须把句柄挂到模块级集合里：``asyncio.create_task`` 只持有弱引用，
+    如果调用方不留引用，GC 一发生任务就可能被收掉、补发中断。
+    """
+    _active_follow_up_tasks.add(task)
+    task.add_done_callback(_active_follow_up_tasks.discard)
+
+
+async def _drain_active_follow_up_tasks() -> None:
+    """等待所有在跑的后台补发任务结束，仅用于卸载与测试同步。"""
+    pending_tasks = [task for task in list(_active_follow_up_tasks) if not task.done()]
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+
 # === 命令保护窗口 ===
 
 def _mark_command_stream_active(stream_id: Any) -> None:
@@ -867,11 +896,22 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         _stream_resend_guards.clear()
         _active_command_streams.clear()
         _recent_command_stream_expiries.clear()
+        # 重新加载时清空后台任务集合：reload 前的任务此时已经持不到新插件实例的 ctx，
+        # 即便仍在跑也无法把消息发出去。直接放手让它们随旧实例的事件循环自然回收。
+        _active_follow_up_tasks.clear()
         if not _SDK_HOOK_HANDLER_AVAILABLE:
             logger.info("当前 maibot_sdk 未导出 HookHandler，智能分段已启用内置 hook_handler 声明兼容")
 
     async def on_unload(self) -> None:
         """处理插件卸载。"""
+        # 卸载前先取消所有在跑的后台补发任务，再等待它们结束。
+        # 不取消的话，任务仍持有 self.ctx 的引用，宿主侧 send 通道可能已经销毁，
+        # 任务会以异常方式失败但日志却落在卸载之后，难以排查。
+        for task in list(_active_follow_up_tasks):
+            if not task.done():
+                task.cancel()
+        await _drain_active_follow_up_tasks()
+        _active_follow_up_tasks.clear()
         _prepared_segment_registry.clear()
         _pending_follow_up_segments.clear()
         _stream_resend_guards.clear()
@@ -1434,7 +1474,14 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         sent: bool = False,
         **kwargs: Any,
     ) -> None:
-        """在首段发送成功后补发其余分段。"""
+        """在首段发送成功后异步补发其余分段。
+
+        宿主对 ``send_service.after_send`` 强制 5000ms 超时，且观察型 hook
+        同样会被 ``asyncio.wait_for`` cancel；过去把补发循环直接 ``await``
+        在 hook 体里，发到一半就被宿主取消，多分段消息后半截内容会丢。
+        这里只在 hook 协程里做查询与登记，真正的串行补发用 ``create_task``
+        丢给后台事件循环——hook 体一返回，宿主就不再监管这个子协程的耗时。
+        """
         del kwargs
 
         if not isinstance(message, dict):
@@ -1479,19 +1526,60 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         except (TypeError, ValueError):
             delay_max = 1.2
 
-        with _guard_stream_resend(stream_id):
-            send_ok = await self._send_segments(
-                stream_id,
-                segments,
+        follow_up_task = asyncio.create_task(
+            self._run_follow_up_segments(
+                stream_id=stream_id,
+                segments=list(segments),
                 delay_base=delay_base,
                 delay_per_char=delay_per_char,
                 delay_max=delay_max,
-                delay_before_first=True,
+                message_id=message_id,
             )
+        )
+        _track_follow_up_task(follow_up_task)
+        return None
+
+    async def _run_follow_up_segments(
+        self,
+        *,
+        stream_id: str,
+        segments: list[str],
+        delay_base: float,
+        delay_per_char: float,
+        delay_max: float,
+        message_id: str,
+    ) -> None:
+        """在后台串行补发剩余分段，并兜住所有异常防止泄漏。"""
+        try:
+            with _guard_stream_resend(stream_id):
+                send_ok = await self._send_segments(
+                    stream_id,
+                    segments,
+                    delay_base=delay_base,
+                    delay_per_char=delay_per_char,
+                    delay_max=delay_max,
+                    delay_before_first=True,
+                )
+        except asyncio.CancelledError:
+            logger.warning(
+                "智能分段后台补发任务被取消，可能是插件卸载导致，stream_id=%s message_id=%s 剩余 %s 段未发完",
+                stream_id,
+                message_id,
+                len(segments),
+            )
+            raise
+        except Exception as exc:
+            logger.error(
+                "智能分段后台补发任务异常，stream_id=%s message_id=%s: %s",
+                stream_id,
+                message_id,
+                exc,
+                exc_info=True,
+            )
+            return
 
         if not send_ok:
             logger.error("智能分段补发失败，stream_id=%s message_id=%s", stream_id, message_id)
-        return None
 
     @Command("smart_seg", description="开关智能分段功能", pattern=r"^/smart_seg(?:\s+(?P<action>on|off|status))?\s*$")
     async def handle_smart_seg(

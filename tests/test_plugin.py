@@ -32,6 +32,7 @@ def _reset_global_state() -> None:
     plugin_module._stream_resend_guards.clear()
     plugin_module._active_command_streams.clear()
     plugin_module._recent_command_stream_expiries.clear()
+    plugin_module._active_follow_up_tasks.clear()
 
 
 def test_get_components_registers_hook_handlers_for_current_host() -> None:
@@ -203,29 +204,34 @@ def test_after_send_uses_visible_first_segment_when_reply_component_rewrites_pro
     )
 
     send_segments_mock = AsyncMock(return_value=True)
+
+    async def _invoke_and_wait() -> None:
+        # hook 体本身已经被改成 create_task + return，调用方拿不到补发任务句柄；
+        # 用 _drain_active_follow_up_tasks 等到后台真正发完，再去 assert mock 调用。
+        await plugin.handle_smart_segmentation_after_send(
+            message={
+                "message_id": "platform-msg-1000",
+                "session_id": "stream-reply",
+                "timestamp": "1000.0",
+                "processed_plain_text": "原消息 第一段",
+                "raw_message": [
+                    {
+                        "type": "reply",
+                        "data": {
+                            "target_message_id": "origin-1",
+                            "target_message_content": "原消息",
+                        },
+                    },
+                    {"type": "text", "data": "第一段"},
+                ],
+            },
+            sent=True,
+        )
+        await plugin_module._drain_active_follow_up_tasks()
+
     try:
         with patch.object(plugin, "_send_segments", send_segments_mock):
-            asyncio.run(
-                plugin.handle_smart_segmentation_after_send(
-                    message={
-                        "message_id": "platform-msg-1000",
-                        "session_id": "stream-reply",
-                        "timestamp": "1000.0",
-                        "processed_plain_text": "原消息 第一段",
-                        "raw_message": [
-                            {
-                                "type": "reply",
-                                "data": {
-                                    "target_message_id": "origin-1",
-                                    "target_message_content": "原消息",
-                                },
-                            },
-                            {"type": "text", "data": "第一段"},
-                        ],
-                    },
-                    sent=True,
-                )
-            )
+            asyncio.run(_invoke_and_wait())
 
         send_segments_mock.assert_awaited_once_with(
             "stream-reply",
@@ -233,6 +239,72 @@ def test_after_send_uses_visible_first_segment_when_reply_component_rewrites_pro
             delay_base=0.1,
             delay_per_char=0.2,
             delay_max=0.3,
+            delay_before_first=True,
+        )
+        assert not plugin_module._pending_follow_up_segments
+    finally:
+        _reset_global_state()
+
+
+def test_after_send_returns_immediately_when_follow_up_is_slower_than_host_timeout() -> None:
+    """宿主对 send_service.after_send 强制 5000ms 超时（OBSERVE 也会被 cancel），
+    所以补发循环必须从 hook 体里剥离到 asyncio.create_task；
+    一旦 hook 自己 await 串行补发，超长消息就会丢掉后半段（实战中表现为多分段
+    回复"……一条黑色针织连衣裙……" 后面 3 段没发出去）。本用例模拟一个比宿主
+    超时还慢的补发协程，验证：
+    1) hook 本身在远低于宿主 5000ms 阈值内返回；
+    2) 剩余分段最终仍然在后台跑完。"""
+    plugin = SmartSegmentationPlugin()
+    tracking_key = plugin_module._build_follow_up_tracking_key(
+        stream_id="stream-late",
+        timestamp="1234.0",
+        visible_text="首段",
+    )
+    plugin_module._register_pending_follow_up_segments(
+        lookup_keys=["msg-late", tracking_key],
+        pending_data={
+            "stream_id": "stream-late",
+            "segments": ["段二", "段三", "段四"],
+            "delay_base": 0.0,
+            "delay_per_char": 0.0,
+            "delay_max": 0.0,
+        },
+    )
+
+    async def _slow_send_segments(*_args, **_kwargs):
+        # 在测试事件循环里也明显比 hook 调用本身慢；如果 hook 体真的 await 它，
+        # 后面的 wait_for(timeout=0.1) 一定会抛 TimeoutError。
+        await asyncio.sleep(0.4)
+        return True
+
+    send_segments_mock = AsyncMock(side_effect=_slow_send_segments)
+
+    async def _run() -> None:
+        with patch.object(plugin, "_send_segments", send_segments_mock):
+            await asyncio.wait_for(
+                plugin.handle_smart_segmentation_after_send(
+                    message={
+                        "message_id": "msg-late",
+                        "session_id": "stream-late",
+                        "timestamp": "1234.0",
+                        "processed_plain_text": "首段",
+                        "raw_message": [{"type": "text", "data": "首段"}],
+                    },
+                    sent=True,
+                ),
+                timeout=0.1,
+            )
+            # hook 已经立即返回，但后台补发还在跑；等它跑完再 assert。
+            await plugin_module._drain_active_follow_up_tasks()
+
+    try:
+        asyncio.run(_run())
+        send_segments_mock.assert_awaited_once_with(
+            "stream-late",
+            ["段二", "段三", "段四"],
+            delay_base=0.0,
+            delay_per_char=0.0,
+            delay_max=0.0,
             delay_before_first=True,
         )
         assert not plugin_module._pending_follow_up_segments
