@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -820,6 +821,92 @@ def _is_stream_guarded(stream_id: str) -> bool:
     return _stream_resend_guards.get(stream_id, 0) > 0
 
 
+def _presync_follow_up_segments_to_maisaka_history(
+    *,
+    stream_id: str,
+    first_message_dict: dict[str, Any],
+    follow_up_segments: list[str],
+) -> bool:
+    """把所有剩余分段一次性预先同步进 maisaka `_chat_history`。
+
+    背景：reply 工具不设置 `pause_execution`（见 reasoning_engine.py:2001-2005），
+    工具调用返回后 reasoning 主循环立刻 `continue` 进入下一轮 planner。如果剩余
+    分段还在后台 task 的 sleep 里没发出去，maisaka 历史只能看到首段——下一轮
+    planner 会判定"还没说完"再调一次 reply 工具，造成对同一条用户消息重复回复。
+
+    解法：拿到首段已发送的 SessionMessage 后，立刻克隆出 N 份只改写 raw_message /
+    processed_plain_text / message_id 的伪 SessionMessage，调宿主侧
+    ``runtime.append_sent_message_to_chat_history`` 把它们写进历史；然后才启动
+    后台 task 真正把这些段发到用户客户端，且发送时 ``sync_to_maisaka_history=False``
+    避免重复入库。
+
+    出于解耦考虑，这里**仅写入运行时 _chat_history**，不触碰数据库存储——
+    实际发送链路里 send_service 会负责把真正落到客户端的消息写库，写库次数与
+    用户实际收到的消息数一一对应。
+    """
+    if not stream_id or not follow_up_segments or not isinstance(first_message_dict, dict):
+        return False
+
+    try:
+        # 这些 import 都是宿主内部 API；插件本身已经在 import src.config / src.llm_models，
+        # 这里维持同样的耦合层级，便于跟着宿主版本一起演进。
+        from src.chat.heart_flow.heartflow_manager import heartflow_manager
+        from src.common.data_models.message_component_data_model import MessageSequence, TextComponent
+        from src.plugin_runtime.hook_payloads import deserialize_session_message
+    except ImportError as exc:
+        logger.warning("智能分段无法导入宿主历史同步依赖，将退化为旧的异步同步路径: %s", exc)
+        return False
+
+    runtime = heartflow_manager.heartflow_chat_list.get(stream_id)
+    if runtime is None:
+        logger.warning(
+            "智能分段无法找到 maisaka runtime，剩余分段将退化到异步同步路径 stream=%s",
+            stream_id,
+        )
+        return False
+
+    try:
+        first_session_message = deserialize_session_message(first_message_dict)
+    except Exception as exc:
+        logger.warning("智能分段反序列化首段 SessionMessage 失败，退化到异步同步路径: %s", exc)
+        return False
+
+    base_message_id = str(getattr(first_session_message, "message_id", "") or "").strip()
+    synced_count = 0
+    for index, segment_text in enumerate(follow_up_segments, start=1):
+        normalized_segment = str(segment_text or "").strip()
+        if not normalized_segment:
+            continue
+        try:
+            # 浅拷贝足够：append_sent_message_to_chat_history 只读 message_info / timestamp /
+            # message_id / is_notify / raw_message，我们只改自己关心的三个字段，其它字段
+            # 跟首段共享引用不会被修改。
+            cloned_message = copy.copy(first_session_message)
+            cloned_message.raw_message = MessageSequence([TextComponent(normalized_segment)])
+            cloned_message.processed_plain_text = normalized_segment
+            # 给每段一个稳定但不冲突的 message_id：避免与首段同 ID 让历史合并丢段。
+            cloned_message.message_id = (
+                f"{base_message_id}_seg{index}" if base_message_id else f"smartseg_{stream_id}_{index}"
+            )
+            if runtime.append_sent_message_to_chat_history(cloned_message, source_kind="guided_reply"):
+                synced_count += 1
+        except Exception as exc:
+            logger.warning(
+                "智能分段预同步第 %s 段进 maisaka 历史失败: %s",
+                index,
+                exc,
+            )
+
+    if synced_count > 0:
+        logger.info(
+            "智能分段已预先同步 %s/%s 段进 maisaka 历史 stream=%s，下一轮 planner 能看到完整回复",
+            synced_count,
+            len(follow_up_segments),
+            stream_id,
+        )
+    return synced_count == len(follow_up_segments)
+
+
 @contextmanager
 def _guard_stream_resend(stream_id: str):
     """在插件自行补发分段消息时临时关闭二次分段。"""
@@ -1186,20 +1273,25 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         delay_per_char: float,
         delay_max: float,
         delay_before_first: bool = False,
+        sync_to_maisaka_history: bool = True,
     ) -> bool:
-        """逐条发送分段结果。"""
+        """逐条发送分段结果。
+
+        ``sync_to_maisaka_history`` 默认 True 是为了让旧的"send_service 同步写历史"
+        路径继续生效；当上层（after_send）已经通过
+        ``_presync_follow_up_segments_to_maisaka_history`` 把所有剩余段同步进
+        历史后，应该把这个参数置为 False，避免同一段被记两次。
+        """
         for index, segment in enumerate(segments):
             if index > 0 or delay_before_first:
                 await asyncio.sleep(self._calculate_send_delay(segment, delay_base, delay_per_char, delay_max))
 
-            # 必须显式声明 sync_to_maisaka_history：cap.send.text 默认是 False，
-            # 不传则补发的分段不会进 maisaka 历史，下一轮规划器只能看到首段，把
-            # 真实回复的剩余内容彻底丢掉。source_kind 与 maisaka 自带的 reply 工具
-            # 保持一致，让 SessionBackedMessage 走 include_reply_components=False 的渲染。
+            # source_kind 与 maisaka 自带的 reply 工具保持一致，让
+            # SessionBackedMessage 走 include_reply_components=False 的渲染。
             send_ok = await self.ctx.send.text(
                 segment,
                 stream_id,
-                sync_to_maisaka_history=True,
+                sync_to_maisaka_history=sync_to_maisaka_history,
                 maisaka_source_kind="guided_reply",
             )
             if not send_ok:
@@ -1526,6 +1618,17 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         except (TypeError, ValueError):
             delay_max = 1.2
 
+        # 先把所有剩余段一次性预同步进 maisaka 历史，再启动后台真正发送任务。
+        # 这是为了挡住下面这条会触发"对同一条用户消息重复回复"的回归路径：
+        # reply 工具不设 pause_execution → reasoning 主循环 continue → 下一轮
+        # planner 立即启动 → 此时后台 task 还在 sleep，maisaka 历史只看到首段
+        # → 模型判定"还没说完"再调一次 reply 工具。
+        history_synced = _presync_follow_up_segments_to_maisaka_history(
+            stream_id=stream_id,
+            first_message_dict=message,
+            follow_up_segments=list(segments),
+        )
+
         follow_up_task = asyncio.create_task(
             self._run_follow_up_segments(
                 stream_id=stream_id,
@@ -1534,6 +1637,9 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                 delay_per_char=delay_per_char,
                 delay_max=delay_max,
                 message_id=message_id,
+                # 预同步成功后，后台实际发送时就不要再让 send_service 重复入库——
+                # 否则同一段会在 maisaka 历史里出现两次。
+                sync_to_maisaka_history=not history_synced,
             )
         )
         _track_follow_up_task(follow_up_task)
@@ -1548,6 +1654,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         delay_per_char: float,
         delay_max: float,
         message_id: str,
+        sync_to_maisaka_history: bool = True,
     ) -> None:
         """在后台串行补发剩余分段，并兜住所有异常防止泄漏。"""
         try:
@@ -1559,6 +1666,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                     delay_per_char=delay_per_char,
                     delay_max=delay_max,
                     delay_before_first=True,
+                    sync_to_maisaka_history=sync_to_maisaka_history,
                 )
         except asyncio.CancelledError:
             logger.warning(

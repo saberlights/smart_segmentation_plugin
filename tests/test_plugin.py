@@ -1,6 +1,7 @@
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -240,6 +241,7 @@ def test_after_send_uses_visible_first_segment_when_reply_component_rewrites_pro
             delay_per_char=0.2,
             delay_max=0.3,
             delay_before_first=True,
+            sync_to_maisaka_history=True,
         )
         assert not plugin_module._pending_follow_up_segments
     finally:
@@ -306,6 +308,7 @@ def test_after_send_returns_immediately_when_follow_up_is_slower_than_host_timeo
             delay_per_char=0.0,
             delay_max=0.0,
             delay_before_first=True,
+            sync_to_maisaka_history=True,
         )
         assert not plugin_module._pending_follow_up_segments
     finally:
@@ -901,3 +904,248 @@ def test_build_segmentation_prompt_mentions_bracket_rule() -> None:
     )
     assert "括号" in prompt
     assert "独立" in prompt
+
+
+def test_presync_follow_up_segments_appends_clones_to_maisaka_history() -> None:
+    """预先同步剩余段进 maisaka._chat_history：每段克隆首段 SessionMessage，
+    改写 raw_message / processed_plain_text / message_id 后调
+    ``runtime.append_sent_message_to_chat_history``。
+    """
+    _reset_global_state()
+
+    # 构造一个最小的可被 deserialize_session_message 接受的 message dict。
+    # 字段参考 PluginMessageUtils._session_message_to_dict 的产物。
+    first_message_dict = {
+        "message_id": "platform-msg-9001",
+        "session_id": "stream-presync",
+        "timestamp": "2026-05-29T08:00:00",
+        "platform": "qq",
+        "is_at": False,
+        "is_emoji": False,
+        "is_picture": False,
+        "is_command": False,
+        "is_mentioned": False,
+        "is_notify": False,
+        "processed_plain_text": "首段",
+        "raw_message": [{"type": "text", "data": "首段"}],
+        "message_info": {
+            "user_info": {
+                "user_id": "10001",
+                "user_nickname": "理理",
+                "user_cardname": "理理",
+            },
+            "group_info": {
+                "group_id": "20001",
+                "group_name": "测试群",
+            },
+            "additional_config": {},
+        },
+    }
+
+    appended: list[tuple[Any, str]] = []
+
+    class _FakeRuntime:
+        def append_sent_message_to_chat_history(self, message, *, source_kind="guided_reply"):
+            appended.append((message, source_kind))
+            return True
+
+    fake_runtime = _FakeRuntime()
+
+    class _FakeHeartflowManager:
+        heartflow_chat_list = {"stream-presync": fake_runtime}
+
+    fake_manager = _FakeHeartflowManager()
+
+    # _presync_follow_up_segments_to_maisaka_history 内部用 from src... import 拿
+    # heartflow_manager，patch 必须落到目标模块属性。
+    import importlib
+
+    heartflow_module = importlib.import_module("src.chat.heart_flow.heartflow_manager")
+
+    try:
+        with patch.object(heartflow_module, "heartflow_manager", fake_manager):
+            ok = plugin_module._presync_follow_up_segments_to_maisaka_history(
+                stream_id="stream-presync",
+                first_message_dict=first_message_dict,
+                follow_up_segments=["段二", "段三"],
+            )
+
+        assert ok is True
+        assert len(appended) == 2
+
+        first_clone, first_source = appended[0]
+        # 必须改写文本，避免后续段拿到首段同样的内容
+        assert first_clone.processed_plain_text == "段二"
+        assert [c.text for c in first_clone.raw_message.components] == ["段二"]
+        # message_id 必须与首段不同，且与下一段也不同，避免合并/去重
+        assert first_clone.message_id != "platform-msg-9001"
+        # source_kind 必须是 guided_reply，沿用 maisaka 自己 reply 工具的语义
+        assert first_source == "guided_reply"
+
+        second_clone, _ = appended[1]
+        assert second_clone.processed_plain_text == "段三"
+        assert second_clone.message_id != first_clone.message_id
+        # message_info 应该跟首段保持一致（同一用户/群）
+        assert second_clone.message_info.user_info.user_id == "10001"
+        assert second_clone.message_info.group_info.group_id == "20001"
+    finally:
+        _reset_global_state()
+
+
+def test_presync_returns_false_when_runtime_missing_so_send_falls_back_to_sync_history() -> None:
+    """maisaka runtime 不存在时（例如插件 reload 中途）必须返回 False，
+    让 _run_follow_up_segments 退回到老的"send_service 同步入库"路径，
+    避免后续段在 maisaka 历史中彻底丢失。"""
+    _reset_global_state()
+
+    class _EmptyHeartflowManager:
+        heartflow_chat_list: dict[str, Any] = {}
+
+    import importlib
+
+    heartflow_module = importlib.import_module("src.chat.heart_flow.heartflow_manager")
+
+    first_message_dict = {
+        "message_id": "platform-msg-9100",
+        "session_id": "stream-missing",
+        "timestamp": "2026-05-29T08:01:00",
+        "platform": "qq",
+        "is_at": False,
+        "is_emoji": False,
+        "is_picture": False,
+        "is_command": False,
+        "is_mentioned": False,
+        "is_notify": False,
+        "processed_plain_text": "首段",
+        "raw_message": [{"type": "text", "data": "首段"}],
+        "message_info": {
+            "user_info": {"user_id": "10001", "user_nickname": "理理", "user_cardname": "理理"},
+            "group_info": {"group_id": "20001", "group_name": "群"},
+            "additional_config": {},
+        },
+    }
+
+    with patch.object(heartflow_module, "heartflow_manager", _EmptyHeartflowManager()):
+        ok = plugin_module._presync_follow_up_segments_to_maisaka_history(
+            stream_id="stream-missing",
+            first_message_dict=first_message_dict,
+            follow_up_segments=["段二"],
+        )
+    assert ok is False
+
+
+def test_after_send_disables_send_service_history_sync_when_presync_succeeded() -> None:
+    """端到端：after_send 命中 pending 后预同步成功 → 后台发送禁用
+    send_service 的 sync_to_maisaka_history，避免每段被记两次。
+    """
+    _reset_global_state()
+    plugin = SmartSegmentationPlugin()
+
+    tracking_key = plugin_module._build_follow_up_tracking_key(
+        stream_id="stream-e2e-presync",
+        timestamp="2026-05-29T09:00:00",
+        visible_text="首段",
+    )
+    plugin_module._register_pending_follow_up_segments(
+        lookup_keys=["msg-e2e", tracking_key],
+        pending_data={
+            "stream_id": "stream-e2e-presync",
+            "segments": ["段二", "段三"],
+            "delay_base": 0.0,
+            "delay_per_char": 0.0,
+            "delay_max": 0.0,
+        },
+    )
+
+    appended_to_history: list[Any] = []
+
+    class _FakeRuntime:
+        def append_sent_message_to_chat_history(self, message, *, source_kind="guided_reply"):
+            appended_to_history.append(message)
+            return True
+
+    class _FakeHeartflowManager:
+        heartflow_chat_list = {"stream-e2e-presync": _FakeRuntime()}
+
+    import importlib
+
+    heartflow_module = importlib.import_module("src.chat.heart_flow.heartflow_manager")
+
+    send_segments_mock = AsyncMock(return_value=True)
+
+    async def _run() -> None:
+        with patch.object(heartflow_module, "heartflow_manager", _FakeHeartflowManager()):
+            with patch.object(plugin, "_send_segments", send_segments_mock):
+                await plugin.handle_smart_segmentation_after_send(
+                    message={
+                        "message_id": "msg-e2e",
+                        "session_id": "stream-e2e-presync",
+                        "timestamp": "2026-05-29T09:00:00",
+                        "platform": "qq",
+                        "is_at": False,
+                        "is_emoji": False,
+                        "is_picture": False,
+                        "is_command": False,
+                        "is_mentioned": False,
+                        "is_notify": False,
+                        "processed_plain_text": "首段",
+                        "raw_message": [{"type": "text", "data": "首段"}],
+                        "message_info": {
+                            "user_info": {
+                                "user_id": "10001",
+                                "user_nickname": "理理",
+                                "user_cardname": "理理",
+                            },
+                            "group_info": {"group_id": "20001", "group_name": "群"},
+                            "additional_config": {},
+                        },
+                    },
+                    sent=True,
+                )
+                await plugin_module._drain_active_follow_up_tasks()
+
+    try:
+        asyncio.run(_run())
+
+        # 1) 预同步把全部剩余段写进了 maisaka 历史（共 2 段）
+        assert len(appended_to_history) == 2
+        assert [m.processed_plain_text for m in appended_to_history] == ["段二", "段三"]
+
+        # 2) 后台 _send_segments 被 sync_to_maisaka_history=False 调用——避免重复入库
+        send_segments_mock.assert_awaited_once()
+        call_kwargs = send_segments_mock.await_args.kwargs
+        assert call_kwargs["sync_to_maisaka_history"] is False
+        # 但 segments 内容与 delays 没被改
+        assert send_segments_mock.await_args.args == ("stream-e2e-presync", ["段二", "段三"])
+        assert call_kwargs["delay_before_first"] is True
+    finally:
+        _reset_global_state()
+
+
+def test_send_segments_honors_sync_to_maisaka_history_false() -> None:
+    """关闭 sync_to_maisaka_history 时，发送链调用必须把这个参数透传下去，
+    否则即使上层走了预同步路径，下层依然会走 send_service 入库，造成重复。"""
+    plugin = SmartSegmentationPlugin()
+    send_text_mock = AsyncMock(return_value=True)
+    mock_ctx = MagicMock()
+    mock_ctx.send = MagicMock()
+    mock_ctx.send.text = send_text_mock
+    plugin._ctx = mock_ctx
+
+    with patch.object(plugin_module.asyncio, "sleep", AsyncMock()):
+        ok = asyncio.run(
+            plugin._send_segments(
+                "stream-no-sync",
+                ["段一", "段二"],
+                delay_base=0.0,
+                delay_per_char=0.0,
+                delay_max=0.0,
+                sync_to_maisaka_history=False,
+            )
+        )
+
+    assert ok is True
+    assert send_text_mock.await_count == 2
+    for call in send_text_mock.await_args_list:
+        assert call.kwargs.get("sync_to_maisaka_history") is False
+        assert call.kwargs.get("maisaka_source_kind") == "guided_reply"
