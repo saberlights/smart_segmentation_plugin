@@ -34,6 +34,15 @@ def _reset_global_state() -> None:
     plugin_module._active_command_streams.clear()
     plugin_module._recent_command_stream_expiries.clear()
     plugin_module._active_follow_up_tasks.clear()
+    follow_up_tasks_by_stream = getattr(plugin_module, "_active_follow_up_tasks_by_stream", None)
+    if isinstance(follow_up_tasks_by_stream, dict):
+        follow_up_tasks_by_stream.clear()
+    follow_up_idle_events = getattr(plugin_module, "_follow_up_idle_events_by_stream", None)
+    if isinstance(follow_up_idle_events, dict):
+        follow_up_idle_events.clear()
+    planner_prompt_follow_ups = getattr(plugin_module, "_planner_prompt_follow_up_registry", None)
+    if isinstance(planner_prompt_follow_ups, dict):
+        planner_prompt_follow_ups.clear()
 
 
 def test_get_components_registers_hook_handlers_for_current_host() -> None:
@@ -49,6 +58,11 @@ def test_get_components_registers_hook_handlers_for_current_host() -> None:
     assert hook_components["smart_segmentation_after_build"]["metadata"]["hook"] == "send_service.after_build_message"
     assert "smart_segmentation_after_send" in hook_components
     assert hook_components["smart_segmentation_after_send"]["metadata"]["hook"] == "send_service.after_send"
+    assert "smart_segmentation_pause_planner_until_follow_ups_finish" in hook_components
+    assert (
+        hook_components["smart_segmentation_pause_planner_until_follow_ups_finish"]["metadata"]["hook"]
+        == "maisaka.planner.before_request"
+    )
     assert "smart_segmentation_command_scope_enter" in hook_components
     assert hook_components["smart_segmentation_command_scope_enter"]["metadata"]["hook"] == "chat.command.before_execute"
     assert "smart_segmentation_command_scope_leave" in hook_components
@@ -311,6 +325,168 @@ def test_after_send_returns_immediately_when_follow_up_is_slower_than_host_timeo
             sync_to_maisaka_history=True,
         )
         assert not plugin_module._pending_follow_up_segments
+    finally:
+        _reset_global_state()
+
+
+def test_planner_before_request_waits_until_same_stream_follow_ups_finish() -> None:
+    """预同步失败时，planner.before_request 也必须等到同 stream 的补发真正结束。
+
+    这是线上严重回归的硬防线：即使 heartflow runtime lookup 失败，插件也不能让
+    下一轮 planner 在"只看到首段、后续分段仍在后台 sleep/send"的窗口里抢跑。
+    """
+    _reset_global_state()
+    plugin = SmartSegmentationPlugin()
+
+    tracking_key = plugin_module._build_follow_up_tracking_key(
+        stream_id="stream-planner-guard",
+        timestamp="5678.0",
+        visible_text="首段",
+    )
+    plugin_module._register_pending_follow_up_segments(
+        lookup_keys=["msg-planner-guard", tracking_key],
+        pending_data={
+            "stream_id": "stream-planner-guard",
+            "segments": ["段二", "段三"],
+            "delay_base": 0.0,
+            "delay_per_char": 0.0,
+            "delay_max": 0.0,
+        },
+    )
+
+    release_send = asyncio.Event()
+    send_started = asyncio.Event()
+
+    async def _blocked_send_segments(*_args, **_kwargs):
+        send_started.set()
+        await release_send.wait()
+        return True
+
+    send_segments_mock = AsyncMock(side_effect=_blocked_send_segments)
+
+    async def _run() -> None:
+        with (
+            patch.object(plugin_module, "_presync_follow_up_segments_to_maisaka_history", return_value=False),
+            patch.object(plugin, "_send_segments", send_segments_mock),
+        ):
+            await plugin.handle_smart_segmentation_after_send(
+                message={
+                    "message_id": "msg-planner-guard",
+                    "session_id": "stream-planner-guard",
+                    "timestamp": "5678.0",
+                    "processed_plain_text": "首段",
+                    "raw_message": [{"type": "text", "data": "首段"}],
+                },
+                sent=True,
+            )
+            await asyncio.wait_for(send_started.wait(), timeout=0.1)
+
+            planner_gate_task = asyncio.create_task(
+                plugin.handle_maisaka_planner_before_request(
+                    session_id="stream-planner-guard",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": '<message msg_id="msg-planner-guard" time="00:00:00" user="理理">\n首段',
+                        }
+                    ],
+                    tool_definitions=[],
+                    selected_history_count=1,
+                    built_message_count=1,
+                    selection_reason="test",
+                )
+            )
+
+            blocked = False
+            try:
+                await asyncio.wait_for(asyncio.shield(planner_gate_task), timeout=0.05)
+            except asyncio.TimeoutError:
+                blocked = True
+            assert blocked is True
+
+            release_send.set()
+            result = await asyncio.wait_for(planner_gate_task, timeout=0.1)
+            assert result["action"] == "continue"
+            modified_messages = result["modified_kwargs"]["messages"]
+            assert len(modified_messages) == 3
+            assert modified_messages[0]["content"].endswith("\n首段")
+            assert modified_messages[1]["content"].endswith("\n段二")
+            assert modified_messages[2]["content"].endswith("\n段三")
+            await plugin_module._drain_active_follow_up_tasks()
+
+    try:
+        asyncio.run(_run())
+        send_segments_mock.assert_awaited_once()
+    finally:
+        _reset_global_state()
+
+
+def test_planner_before_request_reinjects_unsynced_follow_ups_on_later_rounds() -> None:
+    """即使后台补发任务已经结束，后续 planner 轮次也要继续看到未入历史的分段。"""
+    _reset_global_state()
+    plugin = SmartSegmentationPlugin()
+
+    tracking_key = plugin_module._build_follow_up_tracking_key(
+        stream_id="stream-planner-replay",
+        timestamp="6789.0",
+        visible_text="首段",
+    )
+    plugin_module._register_pending_follow_up_segments(
+        lookup_keys=["msg-planner-replay", tracking_key],
+        pending_data={
+            "stream_id": "stream-planner-replay",
+            "segments": ["段二"],
+            "delay_base": 0.0,
+            "delay_per_char": 0.0,
+            "delay_max": 0.0,
+        },
+    )
+
+    send_segments_mock = AsyncMock(return_value=True)
+
+    async def _run() -> None:
+        with (
+            patch.object(plugin_module, "_presync_follow_up_segments_to_maisaka_history", return_value=False),
+            patch.object(plugin, "_send_segments", send_segments_mock),
+        ):
+            await plugin.handle_smart_segmentation_after_send(
+                message={
+                    "message_id": "msg-planner-replay",
+                    "session_id": "stream-planner-replay",
+                    "timestamp": "6789.0",
+                    "processed_plain_text": "首段",
+                    "raw_message": [{"type": "text", "data": "首段"}],
+                    "message_info": {
+                        "user_info": {"user_id": "10001", "user_nickname": "理理", "user_cardname": "理理"},
+                        "group_info": {"group_id": "20001", "group_name": "群"},
+                        "additional_config": {},
+                    },
+                },
+                sent=True,
+            )
+            await plugin_module._drain_active_follow_up_tasks()
+
+            base_messages = [
+                {
+                    "role": "user",
+                    "content": '<message msg_id="msg-planner-replay" time="00:00:00" user="理理">\n首段',
+                }
+            ]
+            first_result = await plugin.handle_maisaka_planner_before_request(
+                session_id="stream-planner-replay",
+                messages=base_messages,
+            )
+            second_result = await plugin.handle_maisaka_planner_before_request(
+                session_id="stream-planner-replay",
+                messages=base_messages,
+            )
+
+            assert first_result["modified_kwargs"]["messages"][1]["content"].endswith("\n段二")
+            assert second_result["modified_kwargs"]["messages"][1]["content"].endswith("\n段二")
+
+    try:
+        asyncio.run(_run())
+        send_segments_mock.assert_awaited_once()
     finally:
         _reset_global_state()
 
