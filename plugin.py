@@ -2,7 +2,6 @@
 
 from collections.abc import Callable
 from contextlib import contextmanager
-from datetime import datetime
 from typing import Any
 
 import asyncio
@@ -89,7 +88,6 @@ _PENDING_FOLLOW_UP_TTL_SECONDS = 60.0
 _active_follow_up_tasks: set["asyncio.Task[Any]"] = set()
 _active_follow_up_tasks_by_stream: dict[str, set["asyncio.Task[Any]"]] = {}
 _follow_up_idle_events_by_stream: dict[str, "asyncio.Event"] = {}
-_planner_prompt_follow_up_registry: dict[str, list[dict[str, Any]]] = {}
 
 # 插件自身补发时关闭二次分段
 _stream_resend_guards: dict[str, int] = {}
@@ -105,11 +103,9 @@ _COMMAND_REPLY_GRACE_SECONDS = 1.0
 # maisaka 早期路径自己的 LLM 超时；这是当前唯一会做分段 LLM 调用的入口。
 _REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS = 12.0
 
-# planner.before_request 的宿主默认超时只有 6000ms，不够覆盖多分段补发。
-_PLANNER_FOLLOW_UP_WAIT_TIMEOUT_MS = 120_000
-_PLANNER_PROMPT_FOLLOW_UP_TTL_SECONDS = 1_800.0
-_PROMPT_MESSAGE_ID_PATTERN = re.compile(r'<message\s+[^>]*?msg_id="([^"]+)"')
-_PROMPT_MESSAGE_USER_PATTERN = re.compile(r'<message\s+[^>]*?user="([^"]+)"')
+# chat.receive.before_process 取宿主默认超时（hook_blocking_timeout_sec，部署里仅 30s），
+# 不够覆盖多分段补发，这里显式放宽到 120s。
+_FOLLOW_UP_WAIT_TIMEOUT_MS = 120_000
 
 
 class _PinnedTaskLLMOrchestrator(LLMOrchestrator):
@@ -839,282 +835,6 @@ async def _drain_active_follow_up_tasks() -> None:
         await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 
-def _prune_expired_planner_prompt_follow_ups() -> None:
-    """清理 planner prompt 回填注册表中过期的补发段。"""
-    if not _planner_prompt_follow_up_registry:
-        return
-
-    now = time.monotonic()
-    for stream_id, bundles in list(_planner_prompt_follow_up_registry.items()):
-        valid_bundles = [bundle for bundle in bundles if bundle.get("expires_at", 0.0) > now]
-        if valid_bundles:
-            _planner_prompt_follow_up_registry[stream_id] = valid_bundles
-            continue
-        _planner_prompt_follow_up_registry.pop(stream_id, None)
-
-
-def _extract_prompt_message_id(prompt_message: dict[str, Any]) -> str:
-    """从序列化 prompt message 中提取 msg_id。"""
-    content = prompt_message.get("content")
-    if not isinstance(content, str):
-        return ""
-
-    match = _PROMPT_MESSAGE_ID_PATTERN.search(content)
-    if match is None:
-        return ""
-    return str(match.group(1) or "").strip()
-
-
-def _extract_prompt_message_user(prompt_message: dict[str, Any]) -> str:
-    """从序列化 prompt message 中提取 user 展示名。"""
-    content = prompt_message.get("content")
-    if not isinstance(content, str):
-        return ""
-
-    match = _PROMPT_MESSAGE_USER_PATTERN.search(content)
-    if match is None:
-        return ""
-    return str(match.group(1) or "").strip()
-
-
-def _extract_prompt_message_body(prompt_message: dict[str, Any]) -> str:
-    """从序列化 prompt message 中提取正文文本。"""
-    content = prompt_message.get("content")
-    if not isinstance(content, str):
-        return ""
-
-    _, _, body = content.partition("\n")
-    return body.strip()
-
-
-def _build_prompt_message_signature(prompt_message: dict[str, Any]) -> tuple[str, str]:
-    """提取 prompt message 的稳定匹配签名。"""
-    return (
-        _extract_prompt_message_user(prompt_message),
-        _extract_prompt_message_body(prompt_message),
-    )
-
-
-def _coerce_prompt_message_timestamp(raw_timestamp: Any) -> datetime:
-    """把 hook 载荷里的时间戳恢复成 planner prefix 需要的 datetime。"""
-    if isinstance(raw_timestamp, datetime):
-        return raw_timestamp
-
-    try:
-        return datetime.fromtimestamp(float(raw_timestamp))
-    except (TypeError, ValueError, OSError, OverflowError):
-        return datetime.now()
-
-
-def _extract_prompt_quote_ids_from_raw_message(raw_message: Any) -> list[str]:
-    """从序列化 raw_message 中提取 reply 组件目标，尽量保留 planner 引用链。"""
-    if not isinstance(raw_message, list):
-        return []
-
-    quote_ids: list[str] = []
-    seen: set[str] = set()
-    for component in raw_message:
-        if not isinstance(component, dict) or str(component.get("type", "") or "").strip() != "reply":
-            continue
-
-        raw_data = component.get("data")
-        if not isinstance(raw_data, dict):
-            continue
-
-        quote_id = str(raw_data.get("target_message_id", "") or "").strip()
-        if not quote_id or quote_id in seen:
-            continue
-
-        seen.add(quote_id)
-        quote_ids.append(quote_id)
-    return quote_ids
-
-
-def _build_prompt_follow_up_bundle(
-    *,
-    stream_id: str,
-    first_message_dict: dict[str, Any],
-    follow_up_segments: list[str],
-) -> dict[str, Any] | None:
-    """把已发送但未入 Maisaka 历史的补发段转换成 planner prompt 可补写的消息。"""
-    if not stream_id or not isinstance(first_message_dict, dict) or not follow_up_segments:
-        return None
-
-    try:
-        from src.maisaka.planner_message_utils import build_session_backed_text_message
-        from src.plugin_runtime.hook_payloads import serialize_prompt_messages
-    except ImportError as exc:
-        logger.warning("智能分段无法导入 planner prompt 回填依赖，跳过补写登记: %s", exc)
-        return None
-
-    raw_message_info = first_message_dict.get("message_info")
-    message_info = raw_message_info if isinstance(raw_message_info, dict) else {}
-    raw_user_info = message_info.get("user_info")
-    user_info = raw_user_info if isinstance(raw_user_info, dict) else {}
-
-    speaker_name = (
-        str(user_info.get("user_cardname", "") or "").strip()
-        or str(user_info.get("user_nickname", "") or "").strip()
-        or str(user_info.get("user_id", "") or "").strip()
-    )
-
-    group_card = str(user_info.get("user_cardname", "") or "").strip()
-    base_message_id = str(first_message_dict.get("message_id", "") or "").strip()
-    timestamp = _coerce_prompt_message_timestamp(first_message_dict.get("timestamp"))
-    quote_ids = _extract_prompt_quote_ids_from_raw_message(first_message_dict.get("raw_message"))
-
-    prompt_messages: list[dict[str, Any]] = []
-    prompt_signatures: list[tuple[str, str]] = []
-    prompt_message_ids: list[str] = []
-
-    for index, segment_text in enumerate(follow_up_segments, start=1):
-        normalized_segment = str(segment_text or "").strip()
-        if not normalized_segment:
-            continue
-
-        prompt_message_id = (
-            f"{base_message_id}_seg{index}" if base_message_id else f"smartseg_{stream_id}_{index}"
-        )
-        context_message = build_session_backed_text_message(
-            speaker_name=speaker_name,
-            text=normalized_segment,
-            timestamp=timestamp,
-            source_kind="guided_reply",
-            group_card=group_card,
-            message_id=prompt_message_id or None,
-            quote_ids=quote_ids,
-            include_message_id=bool(prompt_message_id),
-        )
-        llm_message = context_message.to_llm_message()
-        if llm_message is None:
-            continue
-
-        serialized_messages = serialize_prompt_messages([llm_message])
-        if not serialized_messages:
-            continue
-
-        serialized_prompt_message = serialized_messages[0]
-        prompt_messages.append(serialized_prompt_message)
-        prompt_signatures.append(_build_prompt_message_signature(serialized_prompt_message))
-        prompt_message_ids.append(_extract_prompt_message_id(serialized_prompt_message))
-
-    if not prompt_messages:
-        return None
-
-    return {
-        "anchor_message_id": base_message_id,
-        "message_ids": prompt_message_ids,
-        "prompt_signatures": prompt_signatures,
-        "messages": prompt_messages,
-        "expires_at": time.monotonic() + _PLANNER_PROMPT_FOLLOW_UP_TTL_SECONDS,
-    }
-
-
-def _register_planner_prompt_follow_up_bundle(*, stream_id: str, bundle: dict[str, Any]) -> None:
-    """登记一组需要在 planner prompt 里补写的补发段。"""
-    normalized_stream_id = str(stream_id or "").strip()
-    if not normalized_stream_id:
-        return
-
-    _prune_expired_planner_prompt_follow_ups()
-    existing_bundles = list(_planner_prompt_follow_up_registry.get(normalized_stream_id, []))
-    bundle_anchor = str(bundle.get("anchor_message_id", "") or "").strip()
-    bundle_ids = tuple(str(message_id or "").strip() for message_id in bundle.get("message_ids", []))
-
-    deduped_bundles: list[dict[str, Any]] = []
-    for existing_bundle in existing_bundles:
-        existing_anchor = str(existing_bundle.get("anchor_message_id", "") or "").strip()
-        existing_ids = tuple(
-            str(message_id or "").strip() for message_id in existing_bundle.get("message_ids", [])
-        )
-        if existing_anchor == bundle_anchor and existing_ids == bundle_ids:
-            continue
-        deduped_bundles.append(existing_bundle)
-
-    deduped_bundles.append(bundle)
-    _planner_prompt_follow_up_registry[normalized_stream_id] = deduped_bundles
-
-
-def _find_prompt_message_insert_index(messages: list[dict[str, Any]], anchor_message_id: str) -> int | None:
-    """查找应当插入补发段的位置：优先紧跟首段之后。"""
-    normalized_anchor_message_id = str(anchor_message_id or "").strip()
-    if not normalized_anchor_message_id:
-        return None
-
-    for index, prompt_message in enumerate(messages):
-        if _extract_prompt_message_id(prompt_message) == normalized_anchor_message_id:
-            return index + 1
-    return None
-
-
-def _merge_planner_prompt_follow_up_messages(
-    *,
-    stream_id: str,
-    messages: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int]:
-    """把当前流缺失的补发段补写进本轮 planner prompt。"""
-    normalized_stream_id = str(stream_id or "").strip()
-    if not normalized_stream_id or not isinstance(messages, list):
-        return list(messages), 0
-
-    _prune_expired_planner_prompt_follow_ups()
-    bundles = _planner_prompt_follow_up_registry.get(normalized_stream_id, [])
-    if not bundles:
-        return list(messages), 0
-
-    merged_messages = [copy.deepcopy(message) for message in messages]
-    existing_message_ids = {
-        extracted_id
-        for extracted_id in (_extract_prompt_message_id(message) for message in merged_messages)
-        if extracted_id
-    }
-    existing_signatures = {
-        signature
-        for signature in (_build_prompt_message_signature(message) for message in merged_messages)
-        if signature[0] or signature[1]
-    }
-
-    inserted_count = 0
-    for bundle in bundles:
-        raw_bundle_messages = bundle.get("messages")
-        if not isinstance(raw_bundle_messages, list) or not raw_bundle_messages:
-            continue
-
-        bundle_messages_to_insert: list[dict[str, Any]] = []
-        for prompt_message in raw_bundle_messages:
-            if not isinstance(prompt_message, dict):
-                continue
-
-            prompt_message_id = _extract_prompt_message_id(prompt_message)
-            prompt_signature = _build_prompt_message_signature(prompt_message)
-            if prompt_message_id and prompt_message_id in existing_message_ids:
-                continue
-            if (prompt_signature[0] or prompt_signature[1]) and prompt_signature in existing_signatures:
-                continue
-
-            prompt_message_copy = copy.deepcopy(prompt_message)
-            bundle_messages_to_insert.append(prompt_message_copy)
-            if prompt_message_id:
-                existing_message_ids.add(prompt_message_id)
-            if prompt_signature[0] or prompt_signature[1]:
-                existing_signatures.add(prompt_signature)
-
-        if not bundle_messages_to_insert:
-            continue
-
-        insert_index = _find_prompt_message_insert_index(
-            merged_messages,
-            str(bundle.get("anchor_message_id", "") or "").strip(),
-        )
-        if insert_index is None:
-            insert_index = len(merged_messages)
-
-        merged_messages[insert_index:insert_index] = bundle_messages_to_insert
-        inserted_count += len(bundle_messages_to_insert)
-
-    return merged_messages, inserted_count
-
-
 # === 命令保护窗口 ===
 
 def _mark_command_stream_active(stream_id: Any) -> None:
@@ -1789,40 +1509,38 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         return {"action": "continue"}
 
     @HookHandler(
-        "maisaka.planner.before_request",
-        name="smart_segmentation_pause_planner_until_follow_ups_finish",
-        description="同一聊天流仍有智能分段补发未完成时，阻塞 planner，避免只看到首段就重复回复",
-        timeout_ms=_PLANNER_FOLLOW_UP_WAIT_TIMEOUT_MS,
+        "chat.receive.before_process",
+        name="smart_segmentation_pause_until_follow_ups_finish",
+        description="同一聊天流仍有智能分段补发未完成时，先阻塞入站消息处理，避免 planner 只看到首段就重复回复",
+        timeout_ms=_FOLLOW_UP_WAIT_TIMEOUT_MS,
         order="early",
     )
-    async def handle_maisaka_planner_before_request(
+    async def handle_chat_receive_before_process(
         self,
-        session_id: str = "",
-        messages: list[dict[str, Any]] | None = None,
+        message: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """在 planner 发起下一次 LLM 请求前等待当前流补发完成，并补写缺失分段。"""
+        """在入站消息进入处理链前，阻塞当前流直到智能分段补发任务全部结束。
+
+        旧实现挂在 ``maisaka.planner.before_request`` 上，但宿主会把 planner 的完整
+        prompt（含全量未裁剪图片）随 hook 序列化进 IPC 帧，超大上下文会撑爆传输层
+        16MB 帧上限、令整个 hook 失效（阻塞与去重双双跑不了）。这里改挂只携带入站
+        消息的轻量 hook，仅取 ``session_id`` 做阻塞；补发段进 maisaka 历史的去重完全
+        交给 ``_presync_follow_up_segments_to_maisaka_history``。
+        """
         del kwargs
 
-        normalized_stream_id = str(session_id or "").strip()
+        if not isinstance(message, dict):
+            return {"action": "continue"}
+
+        normalized_stream_id = str(message.get("session_id", "") or "").strip()
         if not normalized_stream_id:
             return {"action": "continue"}
 
-        pending_task_count = _get_active_follow_up_task_count(normalized_stream_id)
-        if pending_task_count > 0:
+        if _get_active_follow_up_task_count(normalized_stream_id) > 0:
             await _wait_for_stream_follow_up_tasks(normalized_stream_id)
 
-        if not isinstance(messages, list):
-            return {"action": "continue"}
-
-        merged_messages, inserted_count = _merge_planner_prompt_follow_up_messages(
-            stream_id=normalized_stream_id,
-            messages=messages,
-        )
-        if inserted_count <= 0:
-            return {"action": "continue"}
-
-        return {"action": "continue", "modified_kwargs": {"messages": merged_messages}}
+        return {"action": "continue"}
 
     @HookHandler(
         "chat.command.before_execute",
@@ -2030,8 +1748,6 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                 delay_per_char=delay_per_char,
                 delay_max=delay_max,
                 message_id=message_id,
-                first_message_dict=dict(message),
-                history_synced=history_synced,
                 # 预同步成功后，后台实际发送时就不要再让 send_service 重复入库——
                 # 否则同一段会在 maisaka 历史里出现两次。
                 sync_to_maisaka_history=not history_synced,
@@ -2049,8 +1765,6 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         delay_per_char: float,
         delay_max: float,
         message_id: str,
-        first_message_dict: dict[str, Any] | None = None,
-        history_synced: bool = True,
         sync_to_maisaka_history: bool = True,
     ) -> None:
         """在后台串行补发剩余分段，并兜住所有异常防止泄漏。"""
@@ -2086,22 +1800,6 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         if not send_ok:
             logger.error("智能分段补发失败，stream_id=%s message_id=%s", stream_id, message_id)
             return
-
-        if history_synced or not isinstance(first_message_dict, dict):
-            return
-
-        prompt_follow_up_bundle = _build_prompt_follow_up_bundle(
-            stream_id=stream_id,
-            first_message_dict=first_message_dict,
-            follow_up_segments=list(segments),
-        )
-        if prompt_follow_up_bundle is None:
-            return
-
-        _register_planner_prompt_follow_up_bundle(
-            stream_id=stream_id,
-            bundle=prompt_follow_up_bundle,
-        )
 
     @Command("smart_seg", description="开关智能分段功能", pattern=r"^/smart_seg(?:\s+(?P<action>on|off|status))?\s*$")
     async def handle_smart_seg(
