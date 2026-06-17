@@ -452,9 +452,26 @@ def _split_segments_at_bracket_boundaries(segments: list[str], *, max_segments: 
 
 # === 预分段缓存 ===
 
+# 与 MaiBot 宿主 ``src.chat.utils.utils.process_llm_response`` 的括号清理正则保持一致；
+# 不在插件侧收窄匹配范围，否则 replyer 原文与 after_build 出站文本的缓存键会再次漂移。
+_HOST_REPLY_POSTPROCESS_BRACKET_PATTERN = re.compile(r"[(\[（](?=.*[一-鿿]).*?[)\]）]")
+_NON_TEXT_REPLY_PLACEHOLDER_PATTERN = re.compile(r"[(\[（]\s*表情包(?:\s*[:：].*?)?\s*[)\]）]")
+
+
+def _strip_host_reply_postprocessed_bracket_content(text: str) -> str:
+    """按宿主 ``process_llm_response`` 的括号清理规则归一化缓存键。"""
+    return _HOST_REPLY_POSTPROCESS_BRACKET_PATTERN.sub("", str(text or ""))
+
+
+def _strip_non_text_reply_placeholders(text: str) -> str:
+    """移除不应作为纯文本补发的回复占位符。"""
+    return _NON_TEXT_REPLY_PLACEHOLDER_PATTERN.sub("", str(text or ""))
+
+
 def _normalize_response_text_for_key(text: str) -> str:
-    """归一化用于查找预分段缓存的文本：剥 thinking + 折叠所有空白。"""
+    """归一化用于查找预分段缓存的文本：剥 thinking + 对齐宿主后处理 + 折叠空白。"""
     cleaned = _strip_thinking_content(str(text or ""))
+    cleaned = _strip_host_reply_postprocessed_bracket_content(cleaned)
     if not cleaned:
         return ""
     return " ".join(cleaned.split())
@@ -482,12 +499,13 @@ def _store_prepared_segments(stream_id: str, response_text: str, segments: list[
     """登记早期路径预分段；返回是否成功登记。"""
     normalized_stream_id = str(stream_id or "").strip()
     text_hash = _hash_normalized_text(response_text)
-    if not normalized_stream_id or not text_hash or not segments:
+    visible_segments = _normalize_prepared_segments_for_host_visibility(segments)
+    if not normalized_stream_id or not text_hash or not visible_segments:
         return False
 
     _prune_expired_prepared_segments()
     _prepared_segment_registry[(normalized_stream_id, text_hash)] = {
-        "segments": list(segments),
+        "segments": visible_segments,
         "expires_at": time.monotonic() + _PREPARED_SEGMENT_TTL_SECONDS,
     }
     return True
@@ -508,6 +526,17 @@ def _pop_prepared_segments(stream_id: str, outbound_text: str) -> list[str] | No
     if not isinstance(segments, list) or not segments:
         return None
     return list(segments)
+
+
+def _normalize_prepared_segments_for_host_visibility(segments: list[str]) -> list[str]:
+    """把预分段清洗成插件补发时应发送的可见文本段。"""
+    visible_segments: list[str] = []
+    for segment in segments:
+        visible_segment = _strip_thinking_content(str(segment or ""))
+        visible_segment = _strip_non_text_reply_placeholders(visible_segment).strip()
+        if visible_segment:
+            visible_segments.append(visible_segment)
+    return visible_segments
 
 
 def _normalize_segments(segments: Any, *, max_segments: int) -> list[str]:
@@ -1491,7 +1520,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "智能分段在 replyer.after_response 阶段超时（> %.2fs），发送前还会再尝试一次",
+                "智能分段在 replyer.after_response 阶段超时（> %.2fs），本次回复将放行原文，发送链不会同步重试分段",
                 _REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS,
             )
             return {"action": "continue"}
@@ -1499,11 +1528,15 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         if not segments or len(segments) <= 1:
             return {"action": "continue"}
 
+        visible_segments = _normalize_prepared_segments_for_host_visibility(segments)
+        if not visible_segments or len(visible_segments) <= 1:
+            return {"action": "continue"}
+
         # 缓存按归一化后的原文 hash 索引；后续 after_build_message 用同样规则做查找。
-        if _store_prepared_segments(normalized_stream_id, normalized_response, segments):
+        if _store_prepared_segments(normalized_stream_id, normalized_response, visible_segments):
             logger.info(
                 "智能分段已在 replyer.after_response 阶段预切分，共 %s 段，已登记到缓存 stream=%s",
-                len(segments),
+                len(visible_segments),
                 normalized_stream_id,
             )
         return {"action": "continue"}
