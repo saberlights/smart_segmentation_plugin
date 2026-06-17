@@ -92,6 +92,56 @@ def test_store_and_pop_prepared_segments_use_normalized_text_hash() -> None:
         _reset_global_state()
 
 
+def test_prepared_segments_match_host_postprocessed_bracket_placeholder() -> None:
+    """宿主删除 `[表情包]` 后，发送阶段仍应命中 replyer 预分段缓存。"""
+    _reset_global_state()
+    raw_response = "哼\n\n我就当你是喜欢我这嘴毒的性格了\n\n[表情包]"
+    outbound_text = "哼\n\n我就当你是喜欢我这嘴毒的性格了"
+
+    try:
+        ok = _store_prepared_segments(
+            "stream-placeholder",
+            raw_response,
+            ["哼", "我就当你是喜欢我这嘴毒的性格了", "[表情包]"],
+        )
+        assert ok
+        assert _hash_normalized_text(raw_response) == _hash_normalized_text(outbound_text)
+
+        segments = _pop_prepared_segments("stream-placeholder", outbound_text)
+        assert segments == ["哼", "我就当你是喜欢我这嘴毒的性格了"]
+        assert not plugin_module._prepared_segment_registry
+    finally:
+        _reset_global_state()
+
+
+def test_cache_key_mirrors_host_bracket_postprocess_pattern() -> None:
+    """缓存键必须镜像宿主的括号清理规则，而不是插件侧自行收窄。"""
+    raw_response = "英文 [emoji] 中文"
+    outbound_text = "英文 中文"
+
+    assert _hash_normalized_text(raw_response) == _hash_normalized_text(outbound_text)
+
+
+def test_prepared_segments_keep_normal_action_bracket_segments() -> None:
+    """只移除非文本占位符，不能误删正常动作括号段。"""
+    _reset_global_state()
+    raw_response = "你好啊（挥手）今天怎么样"
+    outbound_text = "你好啊今天怎么样"
+
+    try:
+        ok = _store_prepared_segments(
+            "stream-action-bracket",
+            raw_response,
+            ["你好啊", "（挥手）", "今天怎么样"],
+        )
+        assert ok
+
+        segments = _pop_prepared_segments("stream-action-bracket", outbound_text)
+        assert segments == ["你好啊", "（挥手）", "今天怎么样"]
+    finally:
+        _reset_global_state()
+
+
 def test_prepared_segments_isolated_across_streams() -> None:
     _reset_global_state()
     try:
@@ -633,6 +683,60 @@ def test_after_build_consumes_prepared_cache_without_calling_segment_text() -> N
         _reset_global_state()
 
 
+def test_after_build_consumes_prepared_cache_after_host_removes_placeholder() -> None:
+    """replyer 原文含 `[表情包]` 但出站文本已被宿主清理时，仍应命中预分段缓存。"""
+    plugin = SmartSegmentationPlugin()
+    runtime_settings = {
+        "min_length": 8,
+        "max_segments": 8,
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "style": "natural",
+        "model_name": "",
+        "delay_base": 0.35,
+        "delay_per_char": 0.015,
+        "delay_max": 1.2,
+    }
+    raw_response = "哼\n\n我就当你是喜欢我这嘴毒的性格了\n\n[表情包]"
+    outbound_text = "哼\n\n我就当你是喜欢我这嘴毒的性格了"
+    segment_text_mock = AsyncMock(return_value=["哼", "我就当你是喜欢我这嘴毒的性格了", "[表情包]"])
+
+    try:
+        with (
+            patch.object(plugin, "_get_segmentation_runtime_settings", AsyncMock(return_value=runtime_settings)),
+            patch.object(plugin, "_segment_text", segment_text_mock),
+        ):
+            early_result = asyncio.run(
+                plugin.handle_maisaka_replyer_after_response(
+                    response=raw_response,
+                    session_id="stream-placeholder-hit",
+                )
+            )
+            result = asyncio.run(
+                plugin.handle_smart_segmentation_after_build(
+                    message={
+                        "message_id": "placeholder-msg-1",
+                        "session_id": "stream-placeholder-hit",
+                        "timestamp": "7000.0",
+                        "raw_message": [{"type": "text", "data": outbound_text}],
+                        "message_info": {"additional_config": {}},
+                    },
+                    stream_id="stream-placeholder-hit",
+                    processed_plain_text=outbound_text,
+                )
+            )
+
+        assert early_result == {"action": "continue"}
+        segment_text_mock.assert_awaited_once()
+        assert result["action"] == "continue"
+        assert result["modified_kwargs"]["processed_plain_text"] == "哼"
+        assert not plugin_module._prepared_segment_registry
+        pending = next(iter(plugin_module._pending_follow_up_segments.values()))
+        assert pending["segments"] == ["我就当你是喜欢我这嘴毒的性格了"]
+    finally:
+        _reset_global_state()
+
+
 def test_maisaka_after_response_stores_prepared_cache() -> None:
     """maisaka.replyer.after_response 阶段应该把分段结果登记到缓存里。"""
     plugin = SmartSegmentationPlugin()
@@ -666,6 +770,41 @@ def test_maisaka_after_response_stores_prepared_cache() -> None:
         segment_text_mock.assert_awaited_once()
         cached = _pop_prepared_segments("stream-prepared", response_text)
         assert cached == ["早期路径把这段足够长的回复", "预先切分好缓存起来"]
+    finally:
+        _reset_global_state()
+
+
+def test_maisaka_after_response_skips_when_segment_text_returns_none() -> None:
+    """LLM 分段失败返回 None 时，replyer hook 应直接放行且不登记空缓存。"""
+    plugin = SmartSegmentationPlugin()
+    runtime_settings = {
+        "min_length": 8,
+        "max_segments": 8,
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "style": "natural",
+        "model_name": "",
+        "delay_base": 0.35,
+        "delay_per_char": 0.015,
+        "delay_max": 1.2,
+    }
+    segment_text_mock = AsyncMock(return_value=None)
+
+    try:
+        with (
+            patch.object(plugin, "_get_segmentation_runtime_settings", AsyncMock(return_value=runtime_settings)),
+            patch.object(plugin, "_segment_text", segment_text_mock),
+        ):
+            result = asyncio.run(
+                plugin.handle_maisaka_replyer_after_response(
+                    response="这是一段足够长的回复文本，但这次模型分段失败返回 None。",
+                    session_id="stream-none",
+                )
+            )
+
+        assert result == {"action": "continue"}
+        segment_text_mock.assert_awaited_once()
+        assert not plugin_module._prepared_segment_registry
     finally:
         _reset_global_state()
 
