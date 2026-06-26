@@ -77,17 +77,6 @@ _PREPARED_SEGMENT_TTL_SECONDS = 60.0
 _pending_follow_up_segments: dict[str, dict[str, Any]] = {}
 _PENDING_FOLLOW_UP_TTL_SECONDS = 60.0
 
-# 后台补发协程的句柄集合。
-# 宿主对 send_service.after_send 这个 hook 强制 5000ms 超时（见
-# src/services/send_service.py 的 default_timeout_ms=5000 与
-# src/plugin_runtime/host/hook_dispatcher.py 里的 asyncio.wait_for），
-# 即便是 OBSERVE 观察型也会被 cancel；如果我们直接在 hook 体里串行补发
-# N 段（每段还要 sleep），到点就会被宿主取消，后半截内容彻底丢失。
-# 解法是让 hook 自己在毫秒级返回，把真正的补发循环丢进 asyncio.create_task
-# 后台执行——子任务和 hook 协程是独立的 Task，父被 cancel 不会连带 cancel 子。
-_active_follow_up_tasks: set["asyncio.Task[Any]"] = set()
-_active_follow_up_tasks_by_stream: dict[str, set["asyncio.Task[Any]"]] = {}
-_follow_up_idle_events_by_stream: dict[str, "asyncio.Event"] = {}
 
 # 插件自身补发时关闭二次分段
 _stream_resend_guards: dict[str, int] = {}
@@ -103,9 +92,9 @@ _COMMAND_REPLY_GRACE_SECONDS = 1.0
 # maisaka 早期路径自己的 LLM 超时；这是当前唯一会做分段 LLM 调用的入口。
 _REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS = 12.0
 
-# chat.receive.before_process 取宿主默认超时（hook_blocking_timeout_sec，部署里仅 30s），
-# 不够覆盖多分段补发，这里显式放宽到 120s。
-_FOLLOW_UP_WAIT_TIMEOUT_MS = 120_000
+# send_service.after_send 宿主默认强制 5000ms 超时；即发即同步在该阻塞窗口里连发多段会
+# 超过这个上限，这里用 handler 级 timeout_ms 显式放宽，避免连发被宿主 cancel 丢尾段。
+_AFTER_SEND_FOLLOW_UP_TIMEOUT_MS = 30_000
 
 
 class _PinnedTaskLLMOrchestrator(LLMOrchestrator):
@@ -751,90 +740,6 @@ def _resolve_pending_follow_up_segments(*, message_id: Any, tracking_key: Any) -
     return None
 
 
-# === 后台补发任务 ===
-
-def _get_follow_up_idle_event(stream_id: Any) -> "asyncio.Event":
-    """返回指定聊天流的补发空闲事件；空闲时为 set。"""
-    normalized_stream_id = str(stream_id or "").strip()
-    idle_event = _follow_up_idle_events_by_stream.get(normalized_stream_id)
-    if idle_event is None:
-        idle_event = asyncio.Event()
-        idle_event.set()
-        if normalized_stream_id:
-            _follow_up_idle_events_by_stream[normalized_stream_id] = idle_event
-    return idle_event
-
-
-def _get_active_follow_up_task_count(stream_id: Any) -> int:
-    """返回指定聊天流正在运行的补发任务数，并顺手清理已完成句柄。"""
-    normalized_stream_id = str(stream_id or "").strip()
-    if not normalized_stream_id:
-        return 0
-
-    stream_tasks = _active_follow_up_tasks_by_stream.get(normalized_stream_id)
-    if not stream_tasks:
-        return 0
-
-    pending_tasks = {task for task in stream_tasks if not task.done()}
-    if pending_tasks:
-        if len(pending_tasks) != len(stream_tasks):
-            _active_follow_up_tasks_by_stream[normalized_stream_id] = pending_tasks
-        return len(pending_tasks)
-
-    _active_follow_up_tasks_by_stream.pop(normalized_stream_id, None)
-    _get_follow_up_idle_event(normalized_stream_id).set()
-    return 0
-
-
-async def _wait_for_stream_follow_up_tasks(stream_id: Any) -> int:
-    """等待指定聊天流的补发任务全部结束，返回等待前的任务数。"""
-    pending_task_count = _get_active_follow_up_task_count(stream_id)
-    if pending_task_count <= 0:
-        return 0
-
-    await _get_follow_up_idle_event(stream_id).wait()
-    return pending_task_count
-
-
-def _track_follow_up_task(task: "asyncio.Task[Any]", *, stream_id: Any) -> None:
-    """登记后台补发任务并在结束时自动摘除。
-
-    必须把句柄挂到模块级集合里：``asyncio.create_task`` 只持有弱引用，
-    如果调用方不留引用，GC 一发生任务就可能被收掉、补发中断。
-    """
-    _active_follow_up_tasks.add(task)
-    normalized_stream_id = str(stream_id or "").strip()
-    if normalized_stream_id:
-        _active_follow_up_tasks_by_stream.setdefault(normalized_stream_id, set()).add(task)
-        _get_follow_up_idle_event(normalized_stream_id).clear()
-
-    def _cleanup(completed_task: "asyncio.Task[Any]") -> None:
-        _active_follow_up_tasks.discard(completed_task)
-        if not normalized_stream_id:
-            return
-
-        stream_tasks = _active_follow_up_tasks_by_stream.get(normalized_stream_id)
-        if stream_tasks is None:
-            _get_follow_up_idle_event(normalized_stream_id).set()
-            return
-
-        stream_tasks.discard(completed_task)
-        if stream_tasks:
-            return
-
-        _active_follow_up_tasks_by_stream.pop(normalized_stream_id, None)
-        _get_follow_up_idle_event(normalized_stream_id).set()
-
-    task.add_done_callback(_cleanup)
-
-
-async def _drain_active_follow_up_tasks() -> None:
-    """等待所有在跑的后台补发任务结束，仅用于卸载与测试同步。"""
-    pending_tasks = [task for task in list(_active_follow_up_tasks) if not task.done()]
-    if pending_tasks:
-        await asyncio.gather(*pending_tasks, return_exceptions=True)
-
-
 # === 命令保护窗口 ===
 
 def _mark_command_stream_active(stream_id: Any) -> None:
@@ -888,96 +793,6 @@ def _get_command_stream_grace_remaining(stream_id: Any) -> float | None:
 def _is_stream_guarded(stream_id: str) -> bool:
     """判断当前流是否处于插件补发保护期。"""
     return _stream_resend_guards.get(stream_id, 0) > 0
-
-
-def _presync_follow_up_segments_to_maisaka_history(
-    *,
-    stream_id: str,
-    first_message_dict: dict[str, Any],
-    follow_up_segments: list[str],
-) -> bool:
-    """把所有剩余分段一次性预先同步进 maisaka `_chat_history`。
-
-    背景：reply 工具不设置 `pause_execution`（见 reasoning_engine.py:2001-2005），
-    工具调用返回后 reasoning 主循环立刻 `continue` 进入下一轮 planner。如果剩余
-    分段还在后台 task 的 sleep 里没发出去，maisaka 历史只能看到首段——下一轮
-    planner 会判定"还没说完"再调一次 reply 工具，造成对同一条用户消息重复回复。
-
-    解法：拿到首段已发送的 SessionMessage 后，立刻克隆出 N 份只改写 raw_message /
-    processed_plain_text / message_id 的伪 SessionMessage，**调宿主侧
-    `send_service._sync_sent_message_to_maisaka_history`** 让它走跟首段同步完全
-    一致的代码路径写入历史；然后才启动后台 task 真正把这些段发到用户客户端，且
-    发送时 ``sync_to_maisaka_history=False`` 避免重复入库。
-
-    为什么用宿主 send_service 内部函数而不是直接拿 runtime 自己 append：之前那条
-    `heartflow_manager.heartflow_chat_list.get(stream_id)` 在生产里观察到返回
-    None（详见 fix 历史），但 reply 工具走 send_service 链路同步首段是 work 的。
-    我们让剩余段复用宿主同样的入口，从而 work 的概率最大。如果走宿主同步函数仍
-    然失败，那 lookup 失败是宿主级问题，插件无法绕开——此时返回 False 让后台
-    task 退化到原有的 send_service 异步同步路径，至少不丢段。
-    """
-    if not stream_id or not follow_up_segments or not isinstance(first_message_dict, dict):
-        return False
-
-    try:
-        # 这些 import 都是宿主内部 API；插件本身已经在 import src.config / src.llm_models，
-        # 这里维持同样的耦合层级，便于跟着宿主版本一起演进。
-        from src.chat.heart_flow.heartflow_manager import heartflow_manager
-        from src.common.data_models.message_component_data_model import MessageSequence, TextComponent
-        from src.plugin_runtime.hook_payloads import deserialize_session_message
-        from src.services.send_service import _sync_sent_message_to_maisaka_history as _host_sync_sent
-    except ImportError as exc:
-        logger.warning("智能分段无法导入宿主历史同步依赖，将退化为旧的异步同步路径: %s", exc)
-        return False
-
-    runtime = heartflow_manager.heartflow_chat_list.get(stream_id)
-    if runtime is None:
-        return False
-
-    try:
-        first_session_message = deserialize_session_message(first_message_dict)
-    except Exception as exc:
-        logger.warning("智能分段反序列化首段 SessionMessage 失败，退化到异步同步路径: %s", exc)
-        return False
-
-    base_message_id = str(getattr(first_session_message, "message_id", "") or "").strip()
-    synced_count = 0
-    for index, segment_text in enumerate(follow_up_segments, start=1):
-        normalized_segment = str(segment_text or "").strip()
-        if not normalized_segment:
-            continue
-        try:
-            # 浅拷贝足够：append_sent_message_to_chat_history 只读 message_info / timestamp /
-            # message_id / is_notify / raw_message，我们只改自己关心的三个字段，其它字段
-            # 跟首段共享引用不会被修改。
-            cloned_message = copy.copy(first_session_message)
-            cloned_message.raw_message = MessageSequence([TextComponent(normalized_segment)])
-            cloned_message.processed_plain_text = normalized_segment
-            # 给每段一个稳定但不冲突的 message_id：避免与首段同 ID 让历史合并丢段。
-            cloned_message.message_id = (
-                f"{base_message_id}_seg{index}" if base_message_id else f"smartseg_{stream_id}_{index}"
-            )
-            # 走宿主 send_service 内部的同步入口：跟首段完全相同的代码路径，
-            # 既然首段在这条路上能成功 append，剩余段也必然能。该函数无返回值，
-            # 异常会被它自己 catch 并打 warning；我们用 lookup 成功＋调用未抛异常
-            # 作为成功标记。
-            _host_sync_sent(cloned_message, source_kind="guided_reply")
-            synced_count += 1
-        except Exception as exc:
-            logger.warning(
-                "智能分段预同步第 %s 段进 maisaka 历史失败: %s",
-                index,
-                exc,
-            )
-
-    if synced_count > 0:
-        logger.info(
-            "智能分段已通过宿主 send_service 预先同步 %s/%s 段进 maisaka 历史 stream=%s",
-            synced_count,
-            len(follow_up_segments),
-            stream_id,
-        )
-    return synced_count == len(follow_up_segments)
 
 
 @contextmanager
@@ -1056,26 +871,14 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         _stream_resend_guards.clear()
         _active_command_streams.clear()
         _recent_command_stream_expiries.clear()
-        # 重新加载时清空后台任务集合：reload 前的任务此时已经持不到新插件实例的 ctx，
-        # 即便仍在跑也无法把消息发出去。直接放手让它们随旧实例的事件循环自然回收。
-        _active_follow_up_tasks.clear()
-        _active_follow_up_tasks_by_stream.clear()
-        _follow_up_idle_events_by_stream.clear()
         if not _SDK_HOOK_HANDLER_AVAILABLE:
             logger.info("当前 maibot_sdk 未导出 HookHandler，智能分段已启用内置 hook_handler 声明兼容")
 
     async def on_unload(self) -> None:
-        """处理插件卸载。"""
-        # 卸载前先取消所有在跑的后台补发任务，再等待它们结束。
-        # 不取消的话，任务仍持有 self.ctx 的引用，宿主侧 send 通道可能已经销毁，
-        # 任务会以异常方式失败但日志却落在卸载之后，难以排查。
-        for task in list(_active_follow_up_tasks):
-            if not task.done():
-                task.cancel()
-        await _drain_active_follow_up_tasks()
-        _active_follow_up_tasks.clear()
-        _active_follow_up_tasks_by_stream.clear()
-        _follow_up_idle_events_by_stream.clear()
+        """处理插件卸载。
+
+        即发即同步后不再有后台补发任务：补发已在 after_send 的阻塞窗口里同步完成。
+        """
         _prepared_segment_registry.clear()
         _pending_follow_up_segments.clear()
         _stream_resend_guards.clear()
@@ -1335,36 +1138,15 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             logger.error("解析智能分段结果失败: %s, 原始返回: %r", exc, response_text)
             return None
 
-    @staticmethod
-    def _calculate_send_delay(segment: str, delay_base: float, delay_per_char: float, delay_max: float) -> float:
-        """根据文本长度计算分条发送间隔。"""
-        normalized_delay = delay_base + len(segment) * delay_per_char + random.uniform(0.0, 0.15)
-        return max(0.0, min(delay_max, normalized_delay))
-
     async def _send_segments(
         self,
         stream_id: str,
         segments: list[str],
         *,
-        delay_base: float,
-        delay_per_char: float,
-        delay_max: float,
-        delay_before_first: bool = False,
         sync_to_maisaka_history: bool = True,
     ) -> bool:
-        """逐条发送分段结果。
-
-        ``sync_to_maisaka_history`` 默认 True 是为了让旧的"send_service 同步写历史"
-        路径继续生效；当上层（after_send）已经通过
-        ``_presync_follow_up_segments_to_maisaka_history`` 把所有剩余段同步进
-        历史后，应该把这个参数置为 False，避免同一段被记两次。
-        """
+        """逐条同步发送分段结果（即发即同步，无段间 sleep）。"""
         for index, segment in enumerate(segments):
-            if index > 0 or delay_before_first:
-                await asyncio.sleep(self._calculate_send_delay(segment, delay_base, delay_per_char, delay_max))
-
-            # source_kind 与 maisaka 自带的 reply 工具保持一致，让
-            # SessionBackedMessage 走 include_reply_components=False 的渲染。
             send_ok = await self.ctx.send.text(
                 segment,
                 stream_id,
@@ -1509,40 +1291,6 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         return {"action": "continue"}
 
     @HookHandler(
-        "chat.receive.before_process",
-        name="smart_segmentation_pause_until_follow_ups_finish",
-        description="同一聊天流仍有智能分段补发未完成时，先阻塞入站消息处理，避免 planner 只看到首段就重复回复",
-        timeout_ms=_FOLLOW_UP_WAIT_TIMEOUT_MS,
-        order="early",
-    )
-    async def handle_chat_receive_before_process(
-        self,
-        message: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """在入站消息进入处理链前，阻塞当前流直到智能分段补发任务全部结束。
-
-        旧实现挂在 ``maisaka.planner.before_request`` 上，但宿主会把 planner 的完整
-        prompt（含全量未裁剪图片）随 hook 序列化进 IPC 帧，超大上下文会撑爆传输层
-        16MB 帧上限、令整个 hook 失效（阻塞与去重双双跑不了）。这里改挂只携带入站
-        消息的轻量 hook，仅取 ``session_id`` 做阻塞；补发段进 maisaka 历史的去重完全
-        交给 ``_presync_follow_up_segments_to_maisaka_history``。
-        """
-        del kwargs
-
-        if not isinstance(message, dict):
-            return {"action": "continue"}
-
-        normalized_stream_id = str(message.get("session_id", "") or "").strip()
-        if not normalized_stream_id:
-            return {"action": "continue"}
-
-        if _get_active_follow_up_task_count(normalized_stream_id) > 0:
-            await _wait_for_stream_follow_up_tasks(normalized_stream_id)
-
-        return {"action": "continue"}
-
-    @HookHandler(
         "chat.command.before_execute",
         name="smart_segmentation_command_scope_enter",
         description="在命令执行期间标记当前聊天流，避免命令回执被智能分段",
@@ -1668,8 +1416,9 @@ class SmartSegmentationPlugin(MaiBotPlugin):
     @HookHandler(
         "send_service.after_send",
         name="smart_segmentation_after_send",
-        description="在首段发送成功后补发剩余智能分段消息",
-        mode=HookMode.OBSERVE,
+        description="在首段发送成功后于同一阻塞窗口内同步补发剩余智能分段消息",
+        mode=HookMode.BLOCKING,
+        timeout_ms=_AFTER_SEND_FOLLOW_UP_TIMEOUT_MS,
     )
     async def handle_smart_segmentation_after_send(
         self,
@@ -1677,24 +1426,16 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         sent: bool = False,
         **kwargs: Any,
     ) -> None:
-        """在首段发送成功后异步补发其余分段。
-
-        宿主对 ``send_service.after_send`` 强制 5000ms 超时，且观察型 hook
-        同样会被 ``asyncio.wait_for`` cancel；过去把补发循环直接 ``await``
-        在 hook 体里，发到一半就被宿主取消，多分段消息后半截内容会丢。
-        这里只在 hook 协程里做查询与登记，真正的串行补发用 ``create_task``
-        丢给后台事件循环——hook 体一返回，宿主就不再监管这个子协程的耗时。
-        """
+        """BLOCKING：在同一阻塞窗口内同步补发剩余分段，reply 工具返回前 N 段已全部落历史。"""
         del kwargs
-
         if not isinstance(message, dict):
             return None
-
         if not sent:
             return None
-
         message_id = str(message.get("message_id", "") or "").strip()
         normalized_stream_id = str(message.get("session_id", "") or "").strip()
+        if normalized_stream_id and _is_stream_guarded(normalized_stream_id):
+            return None
         tracking_text = str(
             message.get("display_message", "")
             or _extract_plain_text_outbound_message(message)
@@ -1706,54 +1447,18 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             timestamp=message.get("timestamp", ""),
             visible_text=tracking_text,
         )
-
         pending_data = _resolve_pending_follow_up_segments(message_id=message_id, tracking_key=tracking_key)
         if pending_data is None:
             return None
-
         stream_id = str(pending_data.get("stream_id", "") or message.get("session_id", "") or "").strip()
         segments = pending_data.get("segments")
         if not stream_id or not isinstance(segments, list) or not segments:
             return None
-
-        try:
-            delay_base = float(pending_data.get("delay_base", 0.35))
-        except (TypeError, ValueError):
-            delay_base = 0.35
-        try:
-            delay_per_char = float(pending_data.get("delay_per_char", 0.015))
-        except (TypeError, ValueError):
-            delay_per_char = 0.015
-        try:
-            delay_max = float(pending_data.get("delay_max", 1.2))
-        except (TypeError, ValueError):
-            delay_max = 1.2
-
-        # 先把所有剩余段一次性预同步进 maisaka 历史，再启动后台真正发送任务。
-        # 这是为了挡住下面这条会触发"对同一条用户消息重复回复"的回归路径：
-        # reply 工具不设 pause_execution → reasoning 主循环 continue → 下一轮
-        # planner 立即启动 → 此时后台 task 还在 sleep，maisaka 历史只看到首段
-        # → 模型判定"还没说完"再调一次 reply 工具。
-        history_synced = _presync_follow_up_segments_to_maisaka_history(
+        await self._run_follow_up_segments(
             stream_id=stream_id,
-            first_message_dict=message,
-            follow_up_segments=list(segments),
+            segments=list(segments),
+            message_id=message_id,
         )
-
-        follow_up_task = asyncio.create_task(
-            self._run_follow_up_segments(
-                stream_id=stream_id,
-                segments=list(segments),
-                delay_base=delay_base,
-                delay_per_char=delay_per_char,
-                delay_max=delay_max,
-                message_id=message_id,
-                # 预同步成功后，后台实际发送时就不要再让 send_service 重复入库——
-                # 否则同一段会在 maisaka 历史里出现两次。
-                sync_to_maisaka_history=not history_synced,
-            )
-        )
-        _track_follow_up_task(follow_up_task, stream_id=stream_id)
         return None
 
     async def _run_follow_up_segments(
@@ -1761,42 +1466,29 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         *,
         stream_id: str,
         segments: list[str],
-        delay_base: float,
-        delay_per_char: float,
-        delay_max: float,
         message_id: str,
         sync_to_maisaka_history: bool = True,
     ) -> None:
-        """在后台串行补发剩余分段，并兜住所有异常防止泄漏。"""
+        """在 after_send 的阻塞窗口内同步补发剩余分段，并兜住异常防止泄漏。"""
         try:
             with _guard_stream_resend(stream_id):
                 send_ok = await self._send_segments(
                     stream_id,
                     segments,
-                    delay_base=delay_base,
-                    delay_per_char=delay_per_char,
-                    delay_max=delay_max,
-                    delay_before_first=True,
                     sync_to_maisaka_history=sync_to_maisaka_history,
                 )
         except asyncio.CancelledError:
             logger.warning(
-                "智能分段后台补发任务被取消，可能是插件卸载导致，stream_id=%s message_id=%s 剩余 %s 段未发完",
-                stream_id,
-                message_id,
-                len(segments),
+                "智能分段补发被取消，stream_id=%s message_id=%s 剩余 %s 段未发完",
+                stream_id, message_id, len(segments),
             )
             raise
         except Exception as exc:
             logger.error(
-                "智能分段后台补发任务异常，stream_id=%s message_id=%s: %s",
-                stream_id,
-                message_id,
-                exc,
-                exc_info=True,
+                "智能分段补发异常，stream_id=%s message_id=%s: %s",
+                stream_id, message_id, exc, exc_info=True,
             )
             return
-
         if not send_ok:
             logger.error("智能分段补发失败，stream_id=%s message_id=%s", stream_id, message_id)
             return

@@ -46,4 +46,4 @@ min_length = 3
 
 # 最大切分段数
 # 避免长文切分过多导致刷屏
-max_segments = 8
+max_segments = 16
