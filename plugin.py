@@ -12,6 +12,7 @@ import os
 import re
 import time
 import tomllib
+import unicodedata
 
 from maibot_sdk import Command, MaiBotPlugin
 from src.config.model_configs import TaskConfig
@@ -275,28 +276,52 @@ def _get_nested_config_value(config_data: dict[str, Any], key: str, default: Any
 
 
 def _strip_thinking_content(text: str) -> str:
-    """移除 thinking 标签及其内容，只保留最终可见正文。"""
+    """移除 thinking 标签及其内容，只保留最终可见正文。
+
+    同时覆盖 ``<thinking>`` 与 doubao/DeepSeek 风格的 ``<think>`` 标签。
+    """
     if not text:
         return ""
 
-    cleaned_text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.IGNORECASE | re.DOTALL)
-    cleaned_text = re.sub(r"</?thinking>", "", cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_text = re.sub(r"</?think(?:ing)?>", "", cleaned_text, flags=re.IGNORECASE)
     return cleaned_text.strip()
 
 
 def _extract_json_array_text(raw_text: str) -> str:
-    """从模型返回中提取 JSON 数组文本。"""
+    """从模型返回中提取 JSON 数组文本。
+
+    围栏提取后仍做一次数组切片：模型可能在围栏内先输出说明文字，
+    或使用大写 ```JSON 围栏。
+    """
     result_text = str(raw_text or "").strip()
-    if "```json" in result_text:
-        return result_text.split("```json", 1)[1].split("```", 1)[0].strip()
-    if "```" in result_text:
-        return result_text.split("```", 1)[1].split("```", 1)[0].strip()
+    fence_index = result_text.lower().find("```json")
+    if fence_index != -1:
+        result_text = result_text[fence_index + len("```json") :].split("```", 1)[0].strip()
+    elif "```" in result_text:
+        result_text = result_text.split("```", 1)[1].split("```", 1)[0].strip()
 
     start = result_text.find("[")
     end = result_text.rfind("]")
     if start != -1 and end != -1 and start < end:
         return result_text[start : end + 1]
     return result_text
+
+
+def _normalize_text_for_content_check(text: str) -> str:
+    """归一化文本用于内容保真比对：NFKC 折叠全半角，仅保留文字/数字并忽略大小写。
+
+    标点、空白、emoji 全部忽略——分段模型允许调整边界标点（去句号/逗号、
+    全角括号转半角、省略独立的"……"），这类差异不应导致分段失效；
+    但字词级的改写、增删必须被拦截。
+    """
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    return "".join(re.findall(r"\w+", normalized)).casefold()
+
+
+def _segments_preserve_original_content(original_text: str, segments: list[str]) -> bool:
+    """校验分段拼接后与原文的文字内容一致（忽略标点、空白、宽度与大小写）。"""
+    return _normalize_text_for_content_check("".join(segments)) == _normalize_text_for_content_check(original_text)
 
 
 # === 括号识别 ===
@@ -1388,8 +1413,9 @@ class SmartSegmentationPlugin(MaiBotPlugin):
 
 要求：
 - 只在自然发送点切分；没有自然切点就保持一条，相关的内容放在一条里，消息长短可以不均匀
-- 原文没有标点时，存在明显的自然发送边界也要分条
-- 不要改写原意或补充内容；仅去掉各条末尾的句号「。」，保留问号、感叹号、省略号、波浪号
+- 原文没有标点时，存在明显的自然发送边界也要分条；原文的换行处通常就是现成的分条边界
+- 不要改写原意，逐字保留原文字词；切点处的句号、逗号可以去掉，问号、感叹号、省略号、波浪号保留
+- 不要在链接、数字或英文单词中间断开
 - 括号内的动作、神态或旁白必须完整、独立成一条；整段只有括号内容时不切
 - 最多分成 {max_segments} 条
 
@@ -1416,6 +1442,9 @@ class SmartSegmentationPlugin(MaiBotPlugin):
     ) -> list[str] | None:
         """调用 LLM 对文本进行分段。"""
         prompt = self._build_segmentation_prompt(text, style, max_segments)
+        # JSON 数组输出体积与原文同量级，长文时固定 max_tokens 会截断输出导致解析失败；
+        # 按原文长度动态扩容，配置值只作为下限。
+        effective_max_tokens = max(max_tokens, len(text) * 2 + 160)
         try:
             target_kind, target_name = await self._resolve_generation_model(model_name)
         except Exception as exc:
@@ -1434,7 +1463,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                     prompt,
                     resolved_model_name=target_name,
                     temperature=temperature,
-                    max_tokens=max_tokens,
+                    max_tokens=effective_max_tokens,
                     request_type="plugin.smart_segmentation.segment",
                 )
             else:
@@ -1442,7 +1471,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                     prompt=prompt,
                     model=target_name,
                     temperature=temperature,
-                    max_tokens=max_tokens,
+                    max_tokens=effective_max_tokens,
                 )
         except Exception as exc:
             logger.error("智能分段 LLM 调用失败: %s", exc, exc_info=True)
@@ -1475,15 +1504,26 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             return None
 
         try:
-            json_text = _extract_json_array_text(response_text)
+            json_text = _extract_json_array_text(_strip_thinking_content(response_text))
             segments = json.loads(json_text)
             normalized = _normalize_segments(segments, max_segments=0)
             # 先合并被模型误拆的括号对，确保每段括号成对；再按括号边界把动作描述拆成独立段。
             balanced = _merge_segments_balancing_brackets(normalized)
-            return _split_segments_at_bracket_boundaries(balanced, max_segments=max_segments)
+            final_segments = _split_segments_at_bracket_boundaries(balanced, max_segments=max_segments)
         except Exception as exc:
             logger.error("解析智能分段结果失败: %s, 原始返回: %r", exc, response_text)
             return None
+
+        # 内容保真校验：只比对文字字词（忽略标点/空白/宽度/大小写）。
+        # 模型改写、增删字词时丢弃本次结果，让上层重试或回退原文直发。
+        if not _segments_preserve_original_content(text, final_segments):
+            logger.warning(
+                "智能分段结果改写了原文字词，丢弃本次分段: 原文=%r 分段=%r",
+                text,
+                final_segments,
+            )
+            return None
+        return final_segments
 
     async def _segment_text_with_delayed_retry(
         self,

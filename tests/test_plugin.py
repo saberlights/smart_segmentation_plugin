@@ -1,4 +1,5 @@
 import asyncio
+import json
 import random
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ from plugins.smart_segmentation_plugin import plugin as plugin_module
 from plugins.smart_segmentation_plugin.plugin import (
     _COMMAND_REPLY_GRACE_SECONDS,
     SmartSegmentationPlugin,
+    _extract_json_array_text,
     _extract_plain_text_outbound_message,
     _get_command_stream_grace_remaining,
     _has_unbalanced_brackets,
@@ -21,9 +23,11 @@ from plugins.smart_segmentation_plugin.plugin import (
     _merge_segments_balancing_brackets,
     _pop_prepared_segments,
     _replace_outbound_text,
+    _segments_preserve_original_content,
     _split_segments_at_bracket_boundaries,
     _split_text_at_brackets,
     _store_prepared_segments,
+    _strip_thinking_content,
 )
 
 
@@ -262,8 +266,8 @@ def test_replyer_segmentation_preserves_overflow_text_within_segment_limit() -> 
         _reset_global_state()
 
 
-def test_replyer_segmentation_accepts_model_rewritten_text() -> None:
-    """插件只消费模型分段，不再对返回正文做字符级等价校验。"""
+def test_replyer_segmentation_rejects_model_rewritten_text() -> None:
+    """字词被模型改写的分段结果必须被丢弃，回退为原文直发。"""
     _reset_global_state()
     plugin = SmartSegmentationPlugin()
     response_text = "原文绝不能被模型修改"
@@ -296,7 +300,7 @@ def test_replyer_segmentation_accepts_model_rewritten_text() -> None:
             )
         )
 
-        assert _pop_prepared_segments("stream-rewritten", response_text) == ["原文已经", "被模型修改"]
+        assert _pop_prepared_segments("stream-rewritten", response_text) is None
     finally:
         _reset_global_state()
 
@@ -1682,7 +1686,8 @@ def test_segment_text_recovers_when_model_splits_brackets() -> None:
     assert segments == ["你好啊", "（理理缓缓起身）", "今天怎么样"]
 
 
-def test_segment_text_keeps_model_bracket_width_without_content_validation() -> None:
+def test_segment_text_keeps_model_bracket_width_through_content_check() -> None:
+    """保真校验忽略括号宽度等标点差异，模型的半角括号结果原样保留。"""
     plugin = SmartSegmentationPlugin()
     original_text = (
         "谁害羞了！\n\n"
@@ -1980,3 +1985,148 @@ def test_segmentation_prompt_calibrates_clear_boundaries_without_punctuation() -
     assert "明显的自然发送边界" in prompt
     assert '原文："你买早饭我到了要吃的"' in prompt
     assert '分条：["你买早饭", "我到了要吃的"]' in prompt
+
+
+def test_strip_thinking_content_covers_think_tag_variants() -> None:
+    assert _strip_thinking_content("<think>推理过程</think>正文") == "正文"
+    assert _strip_thinking_content("<thinking>推理过程</thinking>正文") == "正文"
+    assert _strip_thinking_content("<THINK>大写推理</THINK>正文") == "正文"
+    # 未闭合时只剥离标签本身，保留可见内容
+    assert _strip_thinking_content("正文<think>残留标签") == "正文残留标签"
+
+
+def test_extract_json_array_text_handles_fence_variants() -> None:
+    assert _extract_json_array_text('```json\n["甲", "乙"]\n```') == '["甲", "乙"]'
+    # 大写围栏与围栏内前置说明文字都不应破坏提取
+    assert _extract_json_array_text('```JSON\n分条结果：["甲", "乙"]\n```') == '["甲", "乙"]'
+    assert _extract_json_array_text('好的，分条如下：["甲", "乙"] 希望符合要求') == '["甲", "乙"]'
+    assert _extract_json_array_text('```\n["甲"]\n```') == '["甲"]'
+
+
+def test_content_check_ignores_punctuation_width_and_case() -> None:
+    # 全半角、大小写、标点、空白差异均放行
+    assert _segments_preserve_original_content("Ｈｅｌｌｏ，世界！！", ["hello", "世界"])
+    assert _segments_preserve_original_content("你好啊。（笑）", ["你好啊", "(笑)"])
+    assert _segments_preserve_original_content("……\n\n先睡了", ["先睡了"])
+    # 字词级改写与内容缺失必须被拦截
+    assert not _segments_preserve_original_content("我明天再去", ["我今天再去"])
+    assert not _segments_preserve_original_content("先吃饭然后去看电影", ["先吃饭"])
+
+
+def test_segment_text_rejects_dropped_sentence_and_falls_back() -> None:
+    """模型丢掉半句话时必须丢弃整个分段结果，不能带着缺失内容发出去。"""
+    plugin = SmartSegmentationPlugin()
+    ctx_mock = MagicMock()
+    ctx_mock.llm.generate = AsyncMock(
+        return_value={
+            "success": True,
+            "response": '["今天先聊到这"]',
+            "model_name": "test-model",
+        }
+    )
+    plugin._ctx = ctx_mock
+
+    with patch.object(
+        plugin,
+        "_resolve_generation_model",
+        AsyncMock(return_value=("task", "")),
+    ):
+        segments = asyncio.run(
+            plugin._segment_text(
+                "今天先聊到这，明天记得叫我起床",
+                style="natural",
+                model_name="",
+                max_segments=8,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+
+    assert segments is None
+
+
+def test_delayed_retry_recovers_when_first_result_rewrites_text() -> None:
+    """首次结果改写字词被保真校验拒绝后，重试拿到忠实结果应被采用。"""
+    plugin = SmartSegmentationPlugin()
+    original_text = "先去吃饭，回来再打游戏"
+    ctx_mock = MagicMock()
+    ctx_mock.llm.generate = AsyncMock(
+        side_effect=[
+            {"success": True, "response": '["先去恰饭", "回来再打游戏"]', "model_name": "test-model"},
+            {"success": True, "response": '["先去吃饭", "回来再打游戏"]', "model_name": "test-model"},
+        ]
+    )
+    plugin._ctx = ctx_mock
+
+    with patch.object(
+        plugin,
+        "_resolve_generation_model",
+        AsyncMock(return_value=("task", "")),
+    ):
+        segments = asyncio.run(
+            plugin._segment_text_with_delayed_retry(
+                original_text,
+                style="natural",
+                model_name="",
+                max_segments=8,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+
+    assert segments == ["先去吃饭", "回来再打游戏"]
+    assert ctx_mock.llm.generate.await_count == 2
+
+
+def test_segment_text_scales_max_tokens_with_input_length() -> None:
+    """长文按原文长度扩容 max_tokens，短文保持配置下限，避免 JSON 输出被截断。"""
+    plugin = SmartSegmentationPlugin()
+    long_text = "今天路上看到一只小猫在晒太阳" * 40
+    ctx_mock = MagicMock()
+    ctx_mock.llm.generate = AsyncMock(
+        return_value={
+            "success": True,
+            "response": json.dumps([long_text], ensure_ascii=False),
+            "model_name": "test-model",
+        }
+    )
+    plugin._ctx = ctx_mock
+
+    with patch.object(
+        plugin,
+        "_resolve_generation_model",
+        AsyncMock(return_value=("task", "")),
+    ):
+        segments = asyncio.run(
+            plugin._segment_text(
+                long_text,
+                style="natural",
+                model_name="",
+                max_segments=8,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+
+        assert segments == [long_text]
+        assert ctx_mock.llm.generate.await_args.kwargs["max_tokens"] == len(long_text) * 2 + 160
+
+        short_text = "哈哈好呀"
+        ctx_mock.llm.generate = AsyncMock(
+            return_value={
+                "success": True,
+                "response": '["哈哈", "好呀"]',
+                "model_name": "test-model",
+            }
+        )
+        asyncio.run(
+            plugin._segment_text(
+                short_text,
+                style="natural",
+                model_name="",
+                max_segments=8,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+        assert ctx_mock.llm.generate.await_args.kwargs["max_tokens"] == 600
