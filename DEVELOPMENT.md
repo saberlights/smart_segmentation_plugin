@@ -1,179 +1,206 @@
 # 智能分段插件（smart_segmentation_plugin）开发文档
 
-> 本文档面向维护者，记录插件的运行模型、Hook 链路、核心机制、关键设计决策与历史教训。
-> 阅读源码前先读本文，能避免重复踩坑。
+> 本文档面向维护者，记录插件的运行模型、Hook 链路、当前纯插件折中、分段结果处理与历史教训。
 
 ---
 
 ## 1. 插件定位
 
-对 Maisaka 回复模型产出的**主回复文本**做 LLM 智能分段，并把分段结果**分条发送**到聊天流，
-模拟人类“一句一句说话”的节奏，避免一大段文字刷屏。
+插件只处理 Maisaka 回复模型产出的主回复文本：先让 LLM 选择自然分段边界，再把有效结果分条发送，模拟人类连续聊天的节奏。
 
 - 插件 ID：`saberlights.smart-segmentation-plugin`
+- 当前版本：`1.1.0`
 - 主源码：`plugin.py`
-- 命令：`/smart_seg on|off|status` 运行时开关
+- 命令：`/smart_seg on|off|status`
+
+插件提示分段模型只选择发送边界，但不再对模型结果做字符级原文等价校验。命令回执、memory/expression 文本或其他插件主动发送的文本仍不会进入分段链路。
 
 ---
 
-## 2. 运行模型（最重要，先理解这个）
+## 2. 运行模型
 
-**插件运行在独立子进程（Runner）里，通过 RPC/IPC 与宿主进程通信。**
+插件运行在独立 Runner 子进程，通过 RPC/IPC 与宿主进程通信。
 
-证据与含义：
+- Hook 由宿主跨进程派发到 Runner。
+- 插件子进程直接 `import src.xxx` 得到的是子进程自己的单例，不是宿主正在使用的活对象。
+- 发送和 Maisaka 历史同步必须经 `ctx.send.text(...)` 回到宿主；不能在插件进程里直接修改 `heartflow_manager` 等宿主单例。
 
-- 宿主侧 `src/plugin_runtime/host/supervisor.py` 用 `asyncio.create_subprocess_exec` 拉起
-  Runner 子进程，`_rpc_server` 建连握手；Hook 调用经 `supervisor.invoke_plugin("plugin.invoke_hook", ...)`
-  跨进程派发（见 `hook_dispatcher.py` 的 `response_envelope` / `RPCError` / `ipc_socket_path`）。
-- **致命推论：插件子进程里 `from src.xxx import 某单例` 拿到的是子进程自己 import 的一份全新对象，
-  不是宿主进程里那份有数据的单例。** 任何想直接操作宿主内存单例（如
-  `heartflow_manager.heartflow_chat_list`）的代码，在生产里都会拿到空对象、静默失效。
-- 插件能把消息发出去，是因为走的是 **SDK 能力 `ctx.send.text(...)`**：它经 RPC 回到宿主进程，
-  由宿主的 `src/plugin_runtime/capabilities/core.py::_cap_send_text` → 宿主 `send_service` 执行，
-  发送与历史同步都发生在**宿主进程**。
-
-> 一句话原则：**凡是要落到宿主状态（历史、发送）的操作，必须经 SDK/RPC 走回宿主进程，
-> 绝不能在插件子进程里直接 import 宿主单例去改。**
-
-参见记忆笔记 `prefer-plugin-side-fixes`（优先纯插件方案）与 `avoid-full-plugin-reads`
-（plugin.py 很长，定位用 grep、改用 Edit/sed、验证用 grep+AST，别整文件读）。
-
----
-
-## 3. 宿主侧关键背景：为什么会“重复回复”
-
-这是插件存在的最棘手问题，也是分段架构的核心约束来源。
-
-Maisaka 推理主循环（`src/maisaka/reasoning_engine.py::run_loop`）：
-
-1. 一批消息进来，先跑一次 **Timing Gate**（决定要不要理；`continue` 后该轮内不再跑）。
-2. 进入**内部轮次循环**（`MAX_INTERNAL_ROUNDS = 10`）：planner 调 `reply` 工具发回复。
-3. **`reply` 工具不设 `pause_execution`**（只有 `no_action`/`finish`/`wait` 才设）。所以一次回复后
-   循环 `tool_continue`，**立刻重跑 round-1 planner** 去“判断话说完没”。
-4. round-1 planner 读 maisaka 内部历史（`_chat_history`）。**如果此时它只看到第一段，就会判定
-   “还没说完”，再调一次 `reply`，导致同一条用户消息被回复两次。**
-
-群聊 vs 私聊差异：私聊侧把这个内部轮次/Timing Gate 关掉了，所以 round-1 planner 不重跑、不复现；
-群聊开着就会复现。**所以“重复回复”本质是：分段后，群聊 round-1 planner 在剩余段进入历史之前就抢跑了。**
-
-- `reply` 工具发首段时用宿主进程内的活对象同步历史（`src/maisaka/builtin_tool/reply.py`，
-  `sync_to_maisaka_history=True`），**首段 seg1 一定进历史**。
-- 剩余段 seg2..N 由本插件负责。**只要 seg2..N 没能在 round-1 planner 之前进宿主历史，就会重复回复。**
-
----
-
-## 4. Hook 链路（当前架构：即发即同步）
-
-| Hook | mode | 作用 |
-|---|---|---|
-| `maisaka.replyer.after_response` | 普通 | 拿到模型回复后**预分段**，存入进程内缓存 `_prepared_segment_registry`。这是“该消息是否来自回复模型”的唯一可靠信号。 |
-| `send_service.after_build_message` | 普通 | 消费预分段缓存：把出站消息改写为 **seg1**，把 **seg2..N** 登记到 `_pending_follow_up_segments`。 |
-| `send_service.after_send` | **BLOCKING** | **核心**。seg1 发送成功后触发；在本阻塞窗口内**同步发完** seg2..N，每段 `ctx.send.text(sync_to_maisaka_history=True)` 经 RPC 在宿主侧落历史。 |
-| `chat.command.before_execute` / `after_execute` | 普通 | 命令执行期间标记聊天流，避免命令回执被误分段（`_active_command_streams` + 短保护窗口）。 |
-
-辅助状态：
-- `_prepared_segment_registry`：预分段缓存（TTL 60s）。
-- `_pending_follow_up_segments`：待补发段登记（TTL 60s）。
-- `_stream_resend_guards` + `_guard_stream_resend()`：补发期间关闭二次分段，并让补发段自身的
-  `after_send` 直接放行（防重入）。
-
----
-
-## 5. 核心机制：即发即同步（send-and-sync-immediately）
-
-### 5.1 为什么这样设计
-
-要根治“重复回复”，必须保证 **reply 工具返回前，seg2..N 已全部进入宿主 maisaka 历史**。
-唯一可靠的跨进程落历史途径是 `ctx.send.text(sync_to_maisaka_history=True)`。于是：
-
-- 把 `after_send` 注册为 **`mode=HookMode.BLOCKING`**：宿主发送链路会 `await` 它，
-  reply 工具因此被阻塞到所有分段发完才返回。
-- 在该窗口内**同步 `await` 连发** seg2..N，**不做段间 sleep**。
-- reply 返回时 N 段已全部落历史 → round-1 planner 看到完整回复 → 不再重复回复。
-
-### 5.2 超时处理
-
-`send_service.after_send` 的宿主默认超时 `default_timeout_ms=5000`。连发多段会超过它，
-被 cancel 就会丢尾段。解决：**handler 级 `timeout_ms` 优先于 hook spec 默认值**
-（见 `hook_dispatcher.py::_resolve_timeout_ms`：`if entry.timeout_ms > 0: return entry.timeout_ms`）。
-因此设：
+因此，所有需要改变宿主状态的操作必须使用 SDK 能力。当前后续段通过：
 
 ```python
-_AFTER_SEND_FOLLOW_UP_TIMEOUT_MS = 30_000
+await self.ctx.send.text(
+    segment,
+    stream_id,
+    typing=typing_enabled,
+    sync_to_maisaka_history=True,
+    maisaka_source_kind="guided_reply",
+)
 ```
 
-放宽到 30s，覆盖多段连发，避免 cancel 丢段。
+---
 
-### 5.3 代价（已知权衡）
+## 3. 宿主约束与当前折中
 
-即发即同步**放弃了逐段打字延迟节奏**：所有段几乎连续发出，reply 工具会被阻塞
-≈“段数 × 单段 RPC 往返”的时长（正常 1–3s）后才返回。这是为彻底消除重复回复做的取舍。
+理想实现应由宿主在原生 `reply` 工具内部暴露“最终文本已确定、逐段发送”钩子，使所有分段与原生回复共享同一发送和历史同步时序。当前宿主没有这个精确 seam，只修改插件无法获得同等保证。
 
-> `max_segments` 越大，BLOCKING 阻塞越久。若平台发送较慢，注意观察 reply 返回延迟，
-> 必要时下调 `max_segments`。
+插件能观察到的关键时点是：
+
+1. `maisaka.replyer.after_response`：回复模型刚产出文本，适合预分段。
+2. `send_service.after_build_message`：可以把本次出站正文替换为首段。
+3. `send_service.after_send`：首段平台发送结束，但宿主在该 Hook 返回后仍有存储和 Maisaka 历史同步工作。
+
+当前采用以下折中：
+
+- `after_send` 使用 `OBSERVE`，只快速创建并登记后台补发任务，不让原发送链受固定 Hook 超时约束。
+- 后台任务先让出一次事件循环；启用 `typing_enabled` 时，第一个后续段再由宿主执行真实打字等待。这给首段原发送链完成存储和历史同步留下时间。
+- 后续段顺序 `await` 发送，并逐段设置 `sync_to_maisaka_history=True`。
+- `maisaka.planner.before_request` 为同一聊天流设置内部续轮闸门：等待补发任务完成，并修补已经提前构建、只包含首段的 prompt。
+- `chat.receive.before_process` 为每个聊天流设置等待门：同一流仍有补发任务时，延后处理后来收到的新消息，避免新旧内容交错。
+
+这是插件侧的时序屏障，不改变宿主首段的历史写入顺序：后台尾段仍按真实发送顺序进入历史；planner Hook 额外修补本轮已经序列化的消息窗口。若补发超过 Hook 超时，插件会放弃等待并保留可见错误日志。
 
 ---
 
-## 6. 历史教训（务必读，避免回退到旧坑）
+## 4. Hook 链路
 
-这些是已经踩过、并已修正的坑，源码注释里也保留了说明：
+| Hook | mode | 作用 |
+| --- | --- | --- |
+| `maisaka.replyer.after_response` | `BLOCKING` | 在 25 秒 handler 窗口内预分段，合法的 JSON 数组结果写入 `_prepared_segment_registry`。 |
+| `maisaka.reply.before_post_process` | `BLOCKING` | 精确命中预分段缓存时跳过本次宿主文本后处理，避免出站文本变化导致缓存失配。 |
+| `send_service.after_build_message` | `BLOCKING` | 消费缓存，把出站消息改为首段，并登记剩余段。发送链上不再调用 LLM。 |
+| `send_service.after_send` | `OBSERVE` | 首段发送成功后快速创建后台补发任务。 |
+| `maisaka.planner.before_request` | `BLOCKING` | 等待同流补发完成，并将已构建 prompt 中的首段修补为完整分段。 |
+| `chat.receive.before_process` | `BLOCKING` | 等待同流补发任务结束，再放行新的入站消息。 |
+| `chat.command.before_execute` / `after_execute` | `BLOCKING` | 标记命令作用域及短保护窗口，避免命令回执被误分段。 |
 
-1. **OBSERVE 是 fire-and-forget。** 旧实现把 `after_send` 注册为 `OBSERVE`，宿主用
-   `asyncio.create_task` 后台跑、不被发送链路等待（`hook_dispatcher.py` 第 17 行注释 +
-   `_schedule_observe_handler`）。于是补发与 round-1 planner 赛跑，planner 常抢先 → 重复回复。
-   **结论：要让发送链路等待补发完成，必须用 `BLOCKING`，不能用 `OBSERVE`。**
+主要状态：
 
-2. **后台 task + 段间 sleep 是重复回复的直接成因。** reply 早早返回、剩余段还在 sleep，
-   历史只有 seg1。**已删除**整套后台 task 体系（`_active_follow_up_tasks*`、idle event、
-   `_track/_drain/_wait` 等）与 `_calculate_send_delay`。
-
-3. **presync 跨进程从未生效（已删除）。** 曾有
-   `_presync_follow_up_segments_to_maisaka_history`，企图在插件子进程里直接
-   `import heartflow_manager` 并 `heartflow_chat_list.get()` 抢先写历史。但插件在子进程，
-   拿到的是空单例，`return False` 必然触发，**生产里从未成功过**。它的 docstring 描述的
-   “后台 sleep 导致只看到首段”在即发即同步下也已不成立。**已彻底删除。**
-
-4. **`chat.receive.before_process` 阻塞不在内部轮次链路上（已删除）。** 曾想用它阻塞
-   planner，但 round-1 planner 重跑是推理循环内部 `continue`，根本不走入站处理链路，拦不住。
-   （注：更早还挂过 `maisaka.planner.before_request`，但宿主会把整个 planner prompt 序列化进
-   IPC 帧，撑爆 16MB 帧上限，所以也废弃。）
-
-5. **字节码缓存会加载旧逻辑。** 改完源码若仍报“旧行号 / 旧签名”的错（traceback 行号与磁盘
-   文件对不上），多半是 `__pycache__/plugin.cpython-*.pyc` 陈旧。删掉 `__pycache__` 下的
-   `plugin.cpython-*.pyc` 让运行器按当前源码重新编译。
+- `_prepared_segment_registry`：按 `(stream_id, normalized_text_hash)` 保存预分段结果，TTL 60 秒。
+- `_pending_follow_up_segments`：首段构建完成后，等待 `after_send` 消费的后续段。
+- `_active_follow_up_tasks` / `_active_follow_up_tasks_by_stream`：持有后台 Task 强引用并按流追踪。
+- `_follow_up_idle_events_by_stream`：供同流入站等待门判断补发是否结束。
+- `_planner_follow_up_entries_by_stream`：记录同流回复的完整分段和完成事件，供 planner 闸门消费。
+- `_stream_resend_guards`：补发期间禁止再次进入分段链，避免递归补发。
+- `_active_command_streams` / `_recent_command_stream_expiries`：隔离命令回执。
 
 ---
 
-## 7. 配置项
+## 5. 端到端时序
 
-定义在 `SegmentationSectionConfig`（改配置只改模板并升版本号，不动实际 bot 配置）：
+```text
+replyer 产出原文
+  → after_response 调用分段 LLM
+  → 规范化并合并超出上限的模型分段
+  → 缓存有效分段
+  → before_post_process 精确命中后跳过宿主正文改写
+  → after_build 把原消息替换为 seg1，登记 seg2..N
+  → 宿主发送 seg1
+  → after_send OBSERVE 创建后台 Task 并快速返回
+  → 宿主继续完成 seg1 的存储与历史同步
+  → 后台发送 seg2：宿主先按 typing_speed 等待，再发送并同步历史
+  → 后台依次发送 seg3..N
+  → planner.before_request 等待补发完成，并把 prompt 中的 seg1 修补为 seg1..N
+```
+
+如果此时同一聊天流收到新消息：
+
+```text
+chat.receive.before_process
+  → 发现该流仍有活跃补发 Task
+  → 等待流空闲事件
+  → 补发结束后放行新消息
+```
+
+不同聊天流互不等待。
+
+---
+
+## 6. 分段结果处理
+
+分段提示词沿用早期的真人聊天模仿方式，通过长短不均的具体对话示例校准发送节奏。不要按字符数给模型指定目标段数，也不要把逗号或抽象的“意图变化”默认当作切点；相关内容应留在同一条消息中。配置项 `max_segments` 只作为防止刷屏的硬上限，语义上不适合切分时模型应返回单段。
+
+提示词要求分段模型只选择边界，不要创作或删除内容。插件处理顺序为：
+
+1. 返回值必须是非空 JSON 数组。
+2. 空段会被移除。
+3. 超出 `max_segments` 时保留前 `max_segments - 1` 段，并把模型返回的所有尾段拼回最后一段。
+4. 修复模型误拆的括号内容，并按括号边界拆出完整动作段。
+5. 不再把分段结果与原文逐字符比较；模型返回的措辞、标点和空白会直接用于发送。
+6. JSON 结构或解析异常时拒绝结果，原发送链继续发送原文。
+
+运行时只把 `max_segments` 的下限限制为 1，不设置额外上限；具体段数以插件配置为准。
+
+---
+
+## 7. 模拟打字与发送节奏
+
+插件不再维护自己的延时公式。`segmentation.typing_enabled = true` 时，所有后续段首次发送都传 `typing=True`，由宿主 `send_service` 调用当前 MaiBot 的 `calculate_typing_time`，并读取：
+
+```toml
+[response_post_process]
+typing_speed = 1.0
+```
+
+这项等待不依赖 `enable_response_post_process` 是否开启。`typing_enabled = false` 时插件为所有后续段传 `typing=False`，但仍保持顺序发送和 Maisaka 历史同步。普通文本在 `typing_speed = 0` 时关闭常规等待；数值越大，等待越久。宿主当前对“单个中文字符”有提前返回的固定等待分支，不受 `typing_speed` 控制，插件不复制或修补这项上游语义。
+
+发送时机是“输入当前后续段，再发送当前段”：
+
+```text
+seg1 已由原链发送
+等待 typing_time(seg2) → 发送 seg2
+等待 typing_time(seg3) → 发送 seg3
+...
+发送 segN 后不额外等待
+```
+
+旧配置键 `delay_base`、`delay_per_char`、`delay_max` 已从实现删除。旧配置文件即使仍包含这些键也会被忽略，不能与宿主模拟打字叠加。
+
+---
+
+## 8. 超时与失败语义
+
+- `maisaka.replyer.after_response` 的 handler 超时为 25 秒。首次分段请求超过 6 秒时并发重试同一已配置模型，两个请求共用 20 秒内部总预算；任一请求先返回有效结果即采用并取消另一个，全部失败或超时才保留原文。
+- `send_service.after_send` 只创建后台任务，不承担完整打字等待；`maisaka.planner.before_request` 负责等待同流补发完成。
+- 某个后续段发送失败时停止发送剩余段并记录具体段号，不伪装成功。
+- 插件卸载时取消并 drain 仍在运行的补发任务，避免 Task 泄漏。
+- 同流入站等待有独立超时保护；它用于避免交错，不应被描述为同一 reply planner 的严格屏障。
+
+---
+
+## 9. 历史教训
+
+1. **不要跨进程直接改宿主单例。** 插件子进程中的 `heartflow_manager` 不是宿主活对象；历史同步必须走 SDK/RPC。
+2. **长时间 `BLOCKING after_send` 不适合模拟打字。** 宿主会对 Hook 施加固定超时，累计等待会导致取消和丢尾段。
+3. **裸 `OBSERVE` 后台发送也不够。** 必须持有 Task 强引用、处理卸载，并按聊天流建立等待门，否则新消息容易与旧补发交错。
+4. **入站门有明确边界。** `chat.receive.before_process` 只约束后来到达的消息；同一轮内部续轮由 `maisaka.planner.before_request` 处理。
+5. **planner Hook 只修补轻量消息载荷。** 它不重新调用分段 LLM，也不传输宿主运行时对象；分段仍在 replyer 文本 Hook 完成。
+6. **发送链不能再调用分段 LLM。** 只消费 replyer 阶段的精确缓存，避免慢模型占住发送链，也避免误切非主回复文本。
+7. **缓存匹配必须面对宿主后处理。** 精确命中缓存时跳过本次宿主正文后处理，避免错别字或其他改写使 hash 永久 miss。
+8. **字节码缓存可能加载旧逻辑。** 若 traceback 行号与磁盘源码不一致，检查并清理对应 `__pycache__/plugin.cpython-*.pyc`。
+
+---
+
+## 10. 配置项
 
 | 字段 | 默认 | 说明 |
-|---|---|---|
-| `enabled` | true | 是否启用分段 |
-| `model` | "" | 分段模型，空则用宿主默认 |
-| `style` | natural | 分段风格：natural / conservative / active |
-| `min_length` | 15 | 启用分段的最小文本长度 |
-| `max_segments` | 8 | 最大分段数（即发即同步下直接影响 reply 阻塞时长） |
-| `temperature` | 0.3 | 分段模型温度 |
-| `max_tokens` | 600 | 分段模型最大输出 token |
-| `delay_base` / `delay_per_char` / `delay_max` | — | **历史延迟参数；即发即同步后已不生效（死数据）**，保留仅为配置向后兼容。 |
+| --- | --- | --- |
+| `enabled` | `true` | 是否启用智能分段。 |
+| `model` | `""` | 分段模型；空值交给宿主默认解析。 |
+| `style` | `natural` | `natural` / `conservative` / `active`。 |
+| `min_length` | `15` | 低于此字符数时不分段。 |
+| `max_segments` | `8` | 最大分段数；可在插件配置中自定义，运行时不设置额外上限。 |
+| `temperature` | `0.3` | 分段模型温度。 |
+| `max_tokens` | `600` | 分段模型最大输出 token。 |
+| `typing_enabled` | `true` | 是否为后续分段启用宿主模拟打字等待。 |
+
+插件只控制是否启用模拟打字；具体速度仍属于宿主配置 `response_post_process.typing_speed`。
 
 ---
 
-## 8. 已知遗留 / TODO
+## 11. 维护约定
 
-- `delay_base` / `delay_per_char` / `delay_max`：配置字段、`_get_segmentation_runtime_settings`
-  的读取、`after_build` 登记 pending 时写入的这三项，都是**即发即同步后没人读的死数据**。
-  建议后续单独 `chore` 提交清理（连带决定 config 字段是否删除并升版本号）。
-
----
-
-## 9. 维护这份代码的工作约定
-
-- **不要整文件读 `plugin.py`**（很长，浪费上下文）。定位用 `grep -n`，看局部用 `sed -n 'A,Bp'`，
-  改用 Edit（精确 old_string）或 `sed -i 'A,Bd'`，验证用 `grep -c` + `python3 -c "import ast; ast.parse(...)"`。
-- 多步删除/重构后，务必用 `grep` 复核“是否真的落盘 / 是否产生重复定义 / 是否还有对已删符号的引用”——
-  对话中断容易导致 Edit 没真正写入，留下半成品。
-- 优先纯插件方案；确需改宿主主程序时先申请许可。
-- 提交遵循 Conventional Commits（中文），原子提交，不加 AI 署名。
+- 修改函数、配置字段或 Hook 名时，分别检查直接调用、字符串字面量、类型引用、动态导入和重导出。
+- 核心逻辑变更必须同步更新具体业务断言测试；删除被测逻辑后，测试必须失败。
+- 多步编辑后重新读取目标区域，并运行 `pytest` 验证。
+- 优先纯插件方案；若需要宿主原生 reply 精确时序保证，应明确提出宿主 seam，而不是在插件文档中宣称已经具备。
+- 提交遵循 Conventional Commits（中文），保持原子修改，不加 AI 署名。

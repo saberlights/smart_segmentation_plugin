@@ -1,7 +1,7 @@
 import asyncio
+import random
 import sys
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -32,14 +32,12 @@ def _reset_global_state() -> None:
     plugin_module._pending_follow_up_segments.clear()
     plugin_module._stream_resend_guards.clear()
     plugin_module._active_command_streams.clear()
+    plugin_module._active_command_stream_expiries.clear()
     plugin_module._recent_command_stream_expiries.clear()
     plugin_module._active_follow_up_tasks.clear()
-    follow_up_tasks_by_stream = getattr(plugin_module, "_active_follow_up_tasks_by_stream", None)
-    if isinstance(follow_up_tasks_by_stream, dict):
-        follow_up_tasks_by_stream.clear()
-    follow_up_idle_events = getattr(plugin_module, "_follow_up_idle_events_by_stream", None)
-    if isinstance(follow_up_idle_events, dict):
-        follow_up_idle_events.clear()
+    plugin_module._active_follow_up_tasks_by_stream.clear()
+    plugin_module._follow_up_idle_events_by_stream.clear()
+    plugin_module._planner_follow_up_entries_by_stream.clear()
 
 
 def test_get_components_registers_hook_handlers_for_current_host() -> None:
@@ -55,6 +53,11 @@ def test_get_components_registers_hook_handlers_for_current_host() -> None:
     assert hook_components["smart_segmentation_after_build"]["metadata"]["hook"] == "send_service.after_build_message"
     assert "smart_segmentation_after_send" in hook_components
     assert hook_components["smart_segmentation_after_send"]["metadata"]["hook"] == "send_service.after_send"
+    assert "smart_segmentation_wait_before_planner" in hook_components
+    assert (
+        hook_components["smart_segmentation_wait_before_planner"]["metadata"]["hook"]
+        == "maisaka.planner.before_request"
+    )
     assert "smart_segmentation_pause_until_follow_ups_finish" in hook_components
     assert (
         hook_components["smart_segmentation_pause_until_follow_ups_finish"]["metadata"]["hook"]
@@ -70,6 +73,68 @@ def test_get_components_registers_hook_handlers_for_current_host() -> None:
         hook_components["smart_segmentation_after_replyer_response"]["metadata"]["hook"]
         == "maisaka.replyer.after_response"
     )
+    replyer_hook_timeout_ms = hook_components["smart_segmentation_after_replyer_response"]["metadata"]["timeout_ms"]
+    assert replyer_hook_timeout_ms == 25_000
+    assert replyer_hook_timeout_ms > plugin_module._REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS * 1000
+    assert "smart_segmentation_preserve_prepared_response" in hook_components
+    assert (
+        hook_components["smart_segmentation_preserve_prepared_response"]["metadata"]["hook"]
+        == "maisaka.reply.before_post_process"
+    )
+
+
+def test_runtime_settings_use_one_config_snapshot_and_respect_configured_segment_count() -> None:
+    plugin = SmartSegmentationPlugin()
+    mock_ctx = MagicMock()
+    mock_ctx.config.get_all = AsyncMock(
+        return_value={
+            "plugin": {"enabled": True},
+            "segmentation": {
+                "enabled": True,
+                "model": "utils",
+                "style": "active",
+                "min_length": "3",
+                "max_segments": 99,
+                "temperature": "0.4",
+                "max_tokens": "700",
+                "typing_enabled": False,
+                "delay_base": 99,
+            },
+        }
+    )
+    plugin._ctx = mock_ctx
+
+    with patch.object(plugin, "_load_local_config_fallback", return_value={}):
+        settings = asyncio.run(plugin._get_segmentation_runtime_settings())
+
+    assert settings == {
+        "min_length": 3,
+        "max_segments": 99,
+        "temperature": 0.4,
+        "max_tokens": 700,
+        "style": "active",
+        "model_name": "utils",
+        "typing_enabled": False,
+    }
+    assert mock_ctx.config.get_all.await_count == 1
+
+
+def test_runtime_settings_enable_typing_by_default() -> None:
+    plugin = SmartSegmentationPlugin()
+    mock_ctx = MagicMock()
+    mock_ctx.config.get_all = AsyncMock(
+        return_value={
+            "plugin": {"enabled": True},
+            "segmentation": {"enabled": True},
+        }
+    )
+    plugin._ctx = mock_ctx
+
+    with patch.object(plugin, "_load_local_config_fallback", return_value={}):
+        settings = asyncio.run(plugin._get_segmentation_runtime_settings())
+
+    assert settings is not None
+    assert settings["typing_enabled"] is True
 
 
 def test_store_and_pop_prepared_segments_use_normalized_text_hash() -> None:
@@ -117,6 +182,160 @@ def test_prepared_segments_expire_after_ttl() -> None:
         ):
             assert _pop_prepared_segments("stream-ttl", "段一段二") is None
         assert not plugin_module._prepared_segment_registry
+    finally:
+        _reset_global_state()
+
+
+def test_before_post_process_preserves_response_with_prepared_segments() -> None:
+    _reset_global_state()
+    plugin = SmartSegmentationPlugin()
+    response_text = "第一段第二段"
+
+    try:
+        _store_prepared_segments("stream-post-process", response_text, ["第一段", "第二段"])
+
+        result = asyncio.run(
+            plugin.handle_maisaka_reply_before_post_process(
+                response=response_text,
+                session_id="stream-post-process",
+                reply_message_id="source-message",
+                reply_tool_args={"set_quote": False},
+                skip_post_process=False,
+                enable_splitter=True,
+                enable_chinese_typo=False,
+            )
+        )
+
+        assert result == {
+            "action": "continue",
+            "modified_kwargs": {
+                "response": response_text,
+                "session_id": "stream-post-process",
+                "reply_message_id": "source-message",
+                "reply_tool_args": {"set_quote": False},
+                "skip_post_process": True,
+                "enable_splitter": True,
+                "enable_chinese_typo": False,
+            },
+        }
+        assert _pop_prepared_segments("stream-post-process", response_text) == ["第一段", "第二段"]
+    finally:
+        _reset_global_state()
+
+
+def test_replyer_segmentation_preserves_overflow_text_within_segment_limit() -> None:
+    """模型忽略段数上限时，插件仍必须保留完整回复且不超过配置段数。"""
+    _reset_global_state()
+    plugin = SmartSegmentationPlugin()
+    response_text = "第一段第二段第三段"
+    mock_ctx = MagicMock()
+    mock_ctx.config.get_all = AsyncMock(
+        return_value={
+            "plugin": {"enabled": True},
+            "segmentation": {
+                "enabled": True,
+                "model": "",
+                "min_length": 1,
+                "max_segments": 2,
+            },
+        }
+    )
+    mock_ctx.llm.generate = AsyncMock(
+        return_value={
+            "success": True,
+            "response": '["第一段", "第二段", "第三段"]',
+            "model_name": "test-model",
+        }
+    )
+    plugin._ctx = mock_ctx
+
+    try:
+        asyncio.run(
+            plugin.handle_maisaka_replyer_after_response(
+                response=response_text,
+                session_id="stream-overflow",
+            )
+        )
+
+        assert _pop_prepared_segments("stream-overflow", response_text) == ["第一段", "第二段第三段"]
+    finally:
+        _reset_global_state()
+
+
+def test_replyer_segmentation_accepts_model_rewritten_text() -> None:
+    """插件只消费模型分段，不再对返回正文做字符级等价校验。"""
+    _reset_global_state()
+    plugin = SmartSegmentationPlugin()
+    response_text = "原文绝不能被模型修改"
+    mock_ctx = MagicMock()
+    mock_ctx.config.get_all = AsyncMock(
+        return_value={
+            "plugin": {"enabled": True},
+            "segmentation": {
+                "enabled": True,
+                "model": "",
+                "min_length": 1,
+                "max_segments": 8,
+            },
+        }
+    )
+    mock_ctx.llm.generate = AsyncMock(
+        return_value={
+            "success": True,
+            "response": '["原文已经", "被模型修改"]',
+            "model_name": "test-model",
+        }
+    )
+    plugin._ctx = mock_ctx
+
+    try:
+        asyncio.run(
+            plugin.handle_maisaka_replyer_after_response(
+                response=response_text,
+                session_id="stream-rewritten",
+            )
+        )
+
+        assert _pop_prepared_segments("stream-rewritten", response_text) == ["原文已经", "被模型修改"]
+    finally:
+        _reset_global_state()
+
+
+def test_replyer_segmentation_accepts_model_punctuation_changes() -> None:
+    """标点变化不应导致整个分段结果被丢弃。"""
+    _reset_global_state()
+    plugin = SmartSegmentationPlugin()
+    response_text = "原文没有句号"
+    mock_ctx = MagicMock()
+    mock_ctx.config.get_all = AsyncMock(
+        return_value={
+            "plugin": {"enabled": True},
+            "segmentation": {
+                "enabled": True,
+                "model": "",
+                "min_length": 1,
+                "max_segments": 8,
+            },
+        }
+    )
+    mock_ctx.llm.generate = AsyncMock(
+        return_value={
+            "success": True,
+            "response": '["原文。", "没有句号"]',
+            "model_name": "test-model",
+        }
+    )
+    plugin._ctx = mock_ctx
+
+    try:
+        asyncio.run(
+            plugin.handle_maisaka_replyer_after_response(
+                response=response_text,
+                session_id="stream-inserted-period",
+            )
+        )
+
+        assert _pop_prepared_segments("stream-inserted-period", response_text) == ["原文。", "没有句号"]
     finally:
         _reset_global_state()
 
@@ -209,9 +428,7 @@ def test_after_send_uses_visible_first_segment_when_reply_component_rewrites_pro
         pending_data={
             "stream_id": "stream-reply",
             "segments": ["第二段", "第三段"],
-            "delay_base": 0.1,
-            "delay_per_char": 0.2,
-            "delay_max": 0.3,
+            "typing_enabled": True,
         },
     )
 
@@ -248,11 +465,7 @@ def test_after_send_uses_visible_first_segment_when_reply_component_rewrites_pro
         send_segments_mock.assert_awaited_once_with(
             "stream-reply",
             ["第二段", "第三段"],
-            delay_base=0.1,
-            delay_per_char=0.2,
-            delay_max=0.3,
-            delay_before_first=True,
-            sync_to_maisaka_history=True,
+            typing_enabled=True,
         )
         assert not plugin_module._pending_follow_up_segments
     finally:
@@ -278,9 +491,7 @@ def test_after_send_returns_immediately_when_follow_up_is_slower_than_host_timeo
         pending_data={
             "stream_id": "stream-late",
             "segments": ["段二", "段三", "段四"],
-            "delay_base": 0.0,
-            "delay_per_char": 0.0,
-            "delay_max": 0.0,
+            "typing_enabled": True,
         },
     )
 
@@ -315,13 +526,40 @@ def test_after_send_returns_immediately_when_follow_up_is_slower_than_host_timeo
         send_segments_mock.assert_awaited_once_with(
             "stream-late",
             ["段二", "段三", "段四"],
-            delay_base=0.0,
-            delay_per_char=0.0,
-            delay_max=0.0,
-            delay_before_first=True,
-            sync_to_maisaka_history=True,
+            typing_enabled=True,
         )
         assert not plugin_module._pending_follow_up_segments
+        assert "stream-late" not in plugin_module._follow_up_idle_events_by_stream
+    finally:
+        _reset_global_state()
+
+
+def test_on_unload_allows_in_flight_follow_up_to_finish_within_grace_period() -> None:
+    """正常卸载应先短暂等待已接收的尾段，而不是立刻取消并丢消息。"""
+    plugin = SmartSegmentationPlugin()
+
+    async def _run() -> tuple[list[str], bool]:
+        completed_segments: list[str] = []
+
+        async def _finish_follow_up() -> None:
+            await asyncio.sleep(0.01)
+            completed_segments.append("尾段")
+
+        task = asyncio.create_task(_finish_follow_up())
+        plugin_module._track_follow_up_task(task, stream_id="stream-unload")
+        await asyncio.sleep(0)
+        await plugin.on_unload()
+        return completed_segments, task.cancelled()
+
+    _reset_global_state()
+    try:
+        completed_segments, task_cancelled = asyncio.run(_run())
+
+        assert completed_segments == ["尾段"]
+        assert task_cancelled is False
+        assert not plugin_module._active_follow_up_tasks
+        assert not plugin_module._active_follow_up_tasks_by_stream
+        assert not plugin_module._follow_up_idle_events_by_stream
     finally:
         _reset_global_state()
 
@@ -329,9 +567,8 @@ def test_after_send_returns_immediately_when_follow_up_is_slower_than_host_timeo
 def test_chat_receive_before_process_waits_until_same_stream_follow_ups_finish() -> None:
     """入站消息处理前的轻量阻塞 hook 必须等到同 stream 的补发真正结束。
 
-    这是线上严重回归的硬防线：插件不能让下一轮 planner 在"只看到首段、后续分段仍在
-    后台 sleep/send"的窗口里抢跑。阻塞从吞 20MB prompt 的 maisaka.planner.before_request
-    迁到只带入站消息的 chat.receive.before_process 后，这条防线必须照样生效。
+    用户在机器人仍模拟打字时追发新消息，不能让新一轮入站处理与旧回复交错。
+    这里选择只携带轻量消息体的 chat.receive.before_process，避免传输 planner 大提示词。
     """
     _reset_global_state()
     plugin = SmartSegmentationPlugin()
@@ -346,9 +583,7 @@ def test_chat_receive_before_process_waits_until_same_stream_follow_ups_finish()
         pending_data={
             "stream_id": "stream-planner-guard",
             "segments": ["段二", "段三"],
-            "delay_base": 0.0,
-            "delay_per_char": 0.0,
-            "delay_max": 0.0,
+            "typing_enabled": True,
         },
     )
 
@@ -363,10 +598,7 @@ def test_chat_receive_before_process_waits_until_same_stream_follow_ups_finish()
     send_segments_mock = AsyncMock(side_effect=_blocked_send_segments)
 
     async def _run() -> None:
-        with (
-            patch.object(plugin_module, "_presync_follow_up_segments_to_maisaka_history", return_value=False),
-            patch.object(plugin, "_send_segments", send_segments_mock),
-        ):
+        with patch.object(plugin, "_send_segments", send_segments_mock):
             await plugin.handle_smart_segmentation_after_send(
                 message={
                     "message_id": "msg-planner-guard",
@@ -406,6 +638,181 @@ def test_chat_receive_before_process_waits_until_same_stream_follow_ups_finish()
         _reset_global_state()
 
 
+def test_planner_before_request_waits_for_follow_ups_and_repairs_built_prompt() -> None:
+    """内部 planner 可能先构建 prompt、后进入 Hook；闸门必须等待补发完成，
+    并把已经构建好的首段消息修补为本次完整回复。"""
+    _reset_global_state()
+    plugin = SmartSegmentationPlugin()
+    response_text = "行啊汇报完了，是不是该给点奖励我明天没档期"
+    segments = ["行啊", "汇报完了，是不是该给点奖励", "我明天没档期"]
+    release_send = asyncio.Event()
+    send_started = asyncio.Event()
+
+    async def _blocked_send_segments(*_args, **_kwargs):
+        send_started.set()
+        await release_send.wait()
+        return True
+
+    async def _run() -> None:
+        _store_prepared_segments("stream-planner", response_text, segments)
+        with (
+            patch.object(
+                plugin,
+                "_get_segmentation_runtime_settings",
+                AsyncMock(
+                    return_value={
+                        "min_length": 1,
+                        "max_segments": 8,
+                        "temperature": 0.3,
+                        "max_tokens": 600,
+                        "style": "natural",
+                        "model_name": "",
+                        "typing_enabled": True,
+                    }
+                ),
+            ),
+            patch.object(plugin, "_send_segments", AsyncMock(side_effect=_blocked_send_segments)),
+        ):
+            build_result = await plugin.handle_smart_segmentation_after_build(
+                message={
+                    "message_id": "reply-msg",
+                    "session_id": "stream-planner",
+                    "timestamp": "1000.0",
+                    "raw_message": [{"type": "text", "data": response_text}],
+                    "message_info": {"additional_config": {}},
+                },
+                stream_id="stream-planner",
+                processed_plain_text=response_text,
+            )
+            first_message = build_result["modified_kwargs"]["message"]
+            planner_messages = [
+                {"role": "tool", "content": "工具结果声称三段均已发送"},
+                {
+                    "role": "user",
+                    "content": '<message msg_id="first" user="bot" is_self_message="true">\n行啊',
+                },
+                {"role": "user", "content": "时间：2026-07-26 23:45:52"},
+            ]
+
+            planner_task = asyncio.create_task(
+                plugin.handle_maisaka_planner_before_request(
+                    messages=planner_messages,
+                    tool_definitions=[{"type": "function"}],
+                    selected_history_count=2,
+                    built_message_count=3,
+                    selection_reason="test",
+                    session_id="stream-planner",
+                )
+            )
+            await asyncio.sleep(0)
+            assert planner_task.done() is False
+
+            await plugin.handle_smart_segmentation_after_send(message=first_message, sent=True)
+            await asyncio.wait_for(send_started.wait(), timeout=0.1)
+            assert planner_task.done() is False
+
+            release_send.set()
+            planner_result = await asyncio.wait_for(planner_task, timeout=0.2)
+
+        modified = planner_result["modified_kwargs"]
+        assert modified["messages"][1]["content"].endswith("\n" + "\n".join(segments))
+        assert modified["tool_definitions"] == [{"type": "function"}]
+        assert modified["selected_history_count"] == 2
+        assert modified["built_message_count"] == 3
+        assert modified["selection_reason"] == "test"
+        assert modified["session_id"] == "stream-planner"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        _reset_global_state()
+
+
+def test_planner_releases_quickly_when_first_send_never_reaches_after_send() -> None:
+    """首段在宿主 before_send/路由/Platform IO 阶段失败时不会触发 after_send。
+
+    Planner 只能为异步 OBSERVE Hook 留一个很短的到达窗口，不能误等完整补发超时。
+    """
+    _reset_global_state()
+    plugin = SmartSegmentationPlugin()
+    response_text = "第一段第二段第三段"
+    segments = ["第一段", "第二段", "第三段"]
+
+    async def _run() -> None:
+        _store_prepared_segments("stream-first-send-failed", response_text, segments)
+        with patch.object(
+            plugin,
+            "_get_segmentation_runtime_settings",
+            AsyncMock(
+                return_value={
+                    "min_length": 1,
+                    "max_segments": 8,
+                    "temperature": 0.3,
+                    "max_tokens": 600,
+                    "style": "natural",
+                    "model_name": "",
+                    "typing_enabled": True,
+                }
+            ),
+        ):
+            await plugin.handle_smart_segmentation_after_build(
+                message={
+                    "message_id": "first-send-failed",
+                    "session_id": "stream-first-send-failed",
+                    "timestamp": "1000.0",
+                    "raw_message": [{"type": "text", "data": response_text}],
+                    "message_info": {"additional_config": {}},
+                },
+                stream_id="stream-first-send-failed",
+                processed_plain_text=response_text,
+            )
+
+        with patch.object(
+            plugin_module,
+            "_FIRST_SEND_OBSERVE_GRACE_SECONDS",
+            0.02,
+            create=True,
+        ):
+            result = await asyncio.wait_for(
+                plugin.handle_maisaka_planner_before_request(
+                    messages=[],
+                    session_id="stream-first-send-failed",
+                ),
+                timeout=0.1,
+            )
+
+        assert result["action"] == "continue"
+        assert not plugin_module._pending_follow_up_segments
+
+    try:
+        asyncio.run(_run())
+    finally:
+        _reset_global_state()
+
+
+def test_register_planner_entry_prunes_expired_entries_from_other_streams() -> None:
+    """新回复到来时也必须回收其他流的过期 Planner 状态。"""
+    _reset_global_state()
+    try:
+        expired_entry = plugin_module._register_planner_follow_up_entry(
+            stream_id="stream-expired",
+            segments=["首段", "尾段"],
+        )
+        expired_entry["expires_at"] = 0.0
+
+        current_entry = plugin_module._register_planner_follow_up_entry(
+            stream_id="stream-current",
+            segments=["新首段", "新尾段"],
+        )
+
+        assert "stream-expired" not in plugin_module._planner_follow_up_entries_by_stream
+        assert plugin_module._planner_follow_up_entries_by_stream == {
+            "stream-current": [current_entry],
+        }
+    finally:
+        _reset_global_state()
+
+
 def test_send_segments_marks_follow_ups_for_maisaka_history_sync() -> None:
     """补发的分段必须显式声明 sync_to_maisaka_history，否则 maisaka 历史
     只会留下首段，下一轮规划器会把剩余内容彻底丢掉（实战中表现为：分段后的
@@ -419,24 +826,90 @@ def test_send_segments_marks_follow_ups_for_maisaka_history_sync() -> None:
     # ctx 是只读 property，运行时由 Runner 注入；测试里直接打到下层 _ctx
     plugin._ctx = mock_ctx
 
-    with patch.object(plugin_module.asyncio, "sleep", AsyncMock()):
-        ok = asyncio.run(
-            plugin._send_segments(
-                "stream-history",
-                ["第二段", "第三段"],
-                delay_base=0.1,
-                delay_per_char=0.2,
-                delay_max=0.3,
-                delay_before_first=True,
-            )
+    ok = asyncio.run(
+        plugin._send_segments(
+            "stream-history",
+            ["第二段", "第三段"],
+            typing_enabled=True,
         )
+    )
 
     assert ok is True
     assert send_text_mock.await_count == 2
+    assert [call.args[0] for call in send_text_mock.await_args_list] == ["第二段", "第三段"]
     for call in send_text_mock.await_args_list:
         # ctx.send.text(segment, stream_id, sync_to_maisaka_history=True, maisaka_source_kind="guided_reply")
+        assert call.kwargs.get("typing") is True
         assert call.kwargs.get("sync_to_maisaka_history") is True
         assert call.kwargs.get("maisaka_source_kind") == "guided_reply"
+        assert call.kwargs.get("timeout_ms") == plugin_module._SEND_SEGMENT_RPC_TIMEOUT_MS
+
+
+def test_send_segments_retries_failed_segment_and_continues_with_later_text() -> None:
+    plugin = SmartSegmentationPlugin()
+    send_text_mock = AsyncMock(side_effect=[True, False, False, True])
+    mock_ctx = MagicMock()
+    mock_ctx.send = MagicMock()
+    mock_ctx.send.text = send_text_mock
+    plugin._ctx = mock_ctx
+
+    ok = asyncio.run(
+        plugin._send_segments(
+            "stream-failure",
+            ["第二段", "第三段", "第四段"],
+            typing_enabled=True,
+        )
+    )
+
+    assert ok is False
+    assert [call.args[0] for call in send_text_mock.await_args_list] == [
+        "第二段",
+        "第三段",
+        "第三段",
+        "第四段",
+    ]
+    assert send_text_mock.await_args_list[2].kwargs["typing"] is False
+
+
+def test_send_segments_retries_rpc_exception_without_losing_later_text() -> None:
+    plugin = SmartSegmentationPlugin()
+    send_text_mock = AsyncMock(side_effect=[RuntimeError("rpc disconnected"), True, True])
+    mock_ctx = MagicMock()
+    mock_ctx.send = MagicMock()
+    mock_ctx.send.text = send_text_mock
+    plugin._ctx = mock_ctx
+
+    ok = asyncio.run(
+        plugin._send_segments(
+            "stream-rpc-error",
+            ["第二段", "第三段"],
+            typing_enabled=True,
+        )
+    )
+
+    assert ok is True
+    assert [call.args[0] for call in send_text_mock.await_args_list] == ["第二段", "第二段", "第三段"]
+    assert send_text_mock.await_args_list[1].kwargs["typing"] is False
+
+
+def test_send_segments_disables_typing_for_all_attempts_when_configured_off() -> None:
+    plugin = SmartSegmentationPlugin()
+    send_text_mock = AsyncMock(side_effect=[False, True, True])
+    mock_ctx = MagicMock()
+    mock_ctx.send = MagicMock()
+    mock_ctx.send.text = send_text_mock
+    plugin._ctx = mock_ctx
+
+    ok = asyncio.run(
+        plugin._send_segments(
+            "stream-no-typing",
+            ["第二段", "第三段"],
+            typing_enabled=False,
+        )
+    )
+
+    assert ok is True
+    assert [call.kwargs["typing"] for call in send_text_mock.await_args_list] == [False, False, False]
 
 
 def test_after_build_skips_when_no_prepared_cache_hit() -> None:
@@ -453,9 +926,7 @@ def test_after_build_skips_when_no_prepared_cache_hit() -> None:
         "max_tokens": 600,
         "style": "natural",
         "model_name": "",
-        "delay_base": 0.35,
-        "delay_per_char": 0.015,
-        "delay_max": 1.2,
+        "typing_enabled": True,
     }
     segment_text_mock = AsyncMock(return_value=["不应被调用"])
 
@@ -498,9 +969,7 @@ def test_after_build_does_not_segment_reply_to_message_without_prepared_cache() 
         "max_tokens": 600,
         "style": "natural",
         "model_name": "",
-        "delay_base": 0.35,
-        "delay_per_char": 0.015,
-        "delay_max": 1.2,
+        "typing_enabled": True,
     }
     segment_text_mock = AsyncMock(return_value=["不应被调用"])
 
@@ -548,9 +1017,7 @@ def test_after_build_does_not_segment_plain_bot_text_without_prepared_cache() ->
         "max_tokens": 600,
         "style": "natural",
         "model_name": "",
-        "delay_base": 0.35,
-        "delay_per_char": 0.015,
-        "delay_max": 1.2,
+        "typing_enabled": True,
     }
     segment_text_mock = AsyncMock(return_value=["不应被调用"])
 
@@ -595,9 +1062,7 @@ def test_after_build_consumes_prepared_cache_without_calling_segment_text() -> N
         "max_tokens": 600,
         "style": "natural",
         "model_name": "",
-        "delay_base": 0.35,
-        "delay_per_char": 0.015,
-        "delay_max": 1.2,
+        "typing_enabled": True,
     }
     response_text = "缓存命中走零 LLM 路径，把整段拆成两条发出去。"
     segment_text_mock = AsyncMock(return_value=["不应被调用"])
@@ -633,6 +1098,122 @@ def test_after_build_consumes_prepared_cache_without_calling_segment_text() -> N
         _reset_global_state()
 
 
+def test_after_build_propagates_disabled_typing_to_background_send() -> None:
+    _reset_global_state()
+    plugin = SmartSegmentationPlugin()
+    response_text = "首段尾段"
+    send_segments_mock = AsyncMock(return_value=True)
+
+    async def _run() -> None:
+        _store_prepared_segments("stream-no-typing", response_text, ["首段", "尾段"])
+        with (
+            patch.object(
+                plugin,
+                "_get_segmentation_runtime_settings",
+                AsyncMock(
+                    return_value={
+                        "min_length": 1,
+                        "max_segments": 8,
+                        "temperature": 0.3,
+                        "max_tokens": 600,
+                        "style": "natural",
+                        "model_name": "",
+                        "typing_enabled": False,
+                    }
+                ),
+            ),
+            patch.object(plugin, "_send_segments", send_segments_mock),
+        ):
+            build_result = await plugin.handle_smart_segmentation_after_build(
+                message={
+                    "message_id": "no-typing-message",
+                    "session_id": "stream-no-typing",
+                    "timestamp": "6200.0",
+                    "raw_message": [{"type": "text", "data": response_text}],
+                    "message_info": {"additional_config": {}},
+                },
+                stream_id="stream-no-typing",
+                processed_plain_text=response_text,
+            )
+            await plugin.handle_smart_segmentation_after_send(
+                message=build_result["modified_kwargs"]["message"],
+                sent=True,
+            )
+            await plugin_module._drain_active_follow_up_tasks()
+
+    try:
+        asyncio.run(_run())
+        send_segments_mock.assert_awaited_once_with(
+            "stream-no-typing",
+            ["尾段"],
+            typing_enabled=False,
+        )
+    finally:
+        _reset_global_state()
+
+
+def test_after_build_matches_reply_body_when_host_prepends_attach_at_component() -> None:
+    """attach_at 在 replyer 后处理阶段才加入，不能让已完成的正文预分段缓存失配。"""
+    plugin = SmartSegmentationPlugin()
+    runtime_settings = {
+        "min_length": 8,
+        "max_segments": 8,
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "style": "natural",
+        "model_name": "",
+        "typing_enabled": True,
+    }
+    response_text = "先确认一下这件事我马上回来告诉你结果"
+    at_component = {
+        "type": "at",
+        "data": {
+            "target_user_id": "42",
+            "target_user_nickname": "久远",
+            "target_user_cardname": "久远",
+        },
+    }
+
+    try:
+        _store_prepared_segments(
+            "stream-attach-at",
+            response_text,
+            ["先确认一下这件事", "我马上回来告诉你结果"],
+        )
+        with patch.object(
+            plugin,
+            "_get_segmentation_runtime_settings",
+            AsyncMock(return_value=runtime_settings),
+        ):
+            result = asyncio.run(
+                plugin.handle_smart_segmentation_after_build(
+                    message={
+                        "message_id": "attach-at-msg",
+                        "session_id": "stream-attach-at",
+                        "timestamp": "6100.0",
+                        "raw_message": [
+                            at_component,
+                            {"type": "text", "data": response_text},
+                        ],
+                        "message_info": {"additional_config": {}},
+                    },
+                    stream_id="stream-attach-at",
+                    processed_plain_text=f"@久远{response_text}",
+                )
+            )
+
+        first_message = result["modified_kwargs"]["message"]
+        assert first_message["processed_plain_text"] == "@久远先确认一下这件事"
+        assert first_message["raw_message"] == [
+            at_component,
+            {"type": "text", "data": "先确认一下这件事"},
+        ]
+        assert plugin_module._pending_follow_up_segments
+        assert not plugin_module._prepared_segment_registry
+    finally:
+        _reset_global_state()
+
+
 def test_maisaka_after_response_stores_prepared_cache() -> None:
     """maisaka.replyer.after_response 阶段应该把分段结果登记到缓存里。"""
     plugin = SmartSegmentationPlugin()
@@ -643,9 +1224,7 @@ def test_maisaka_after_response_stores_prepared_cache() -> None:
         "max_tokens": 600,
         "style": "natural",
         "model_name": "",
-        "delay_base": 0.35,
-        "delay_per_char": 0.015,
-        "delay_max": 1.2,
+        "typing_enabled": True,
     }
     response_text = "早期路径把这段足够长的回复预先切分好缓存起来。"
     segment_text_mock = AsyncMock(return_value=["早期路径把这段足够长的回复", "预先切分好缓存起来"])
@@ -670,6 +1249,169 @@ def test_maisaka_after_response_stores_prepared_cache() -> None:
         _reset_global_state()
 
 
+def test_maisaka_after_response_retries_stalled_segmentation_model() -> None:
+    """首个分段请求卡住时，第二次同配置模型请求成功后仍应完成预分段。"""
+    plugin = SmartSegmentationPlugin()
+    runtime_settings = {
+        "min_length": 1,
+        "max_segments": 8,
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "style": "natural",
+        "model_name": "doubao1.6",
+    }
+    response_text = "你自己打出来的字问我，装什么，这会儿倒开始纯了，不告诉你，自己百度"
+
+    async def _run() -> tuple[dict[str, object], list[str], bool]:
+        attempt_count = 0
+        attempted_models: list[str] = []
+        first_attempt_cancelled = asyncio.Event()
+
+        async def _segment_text(*_args, **_kwargs):
+            nonlocal attempt_count
+            attempt_count += 1
+            attempted_models.append(_kwargs["model_name"])
+            if attempt_count == 1:
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    first_attempt_cancelled.set()
+                    raise
+            return ["你自己打出来的字问我", "装什么", "这会儿倒开始纯了", "不告诉你，自己百度"]
+
+        with (
+            patch.object(plugin, "_get_segmentation_runtime_settings", AsyncMock(return_value=runtime_settings)),
+            patch.object(plugin, "_segment_text", AsyncMock(side_effect=_segment_text)),
+            patch.object(plugin_module, "_REPLYER_SEGMENT_RETRY_DELAY_SECONDS", 0.01),
+            patch.object(plugin_module, "_REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS", 0.2),
+        ):
+            result = await plugin.handle_maisaka_replyer_after_response(
+                response=response_text,
+                session_id="stream-stalled-segmentation",
+            )
+        return result, attempted_models, first_attempt_cancelled.is_set()
+
+    _reset_global_state()
+    try:
+        result, attempted_models, first_attempt_cancelled = asyncio.run(_run())
+
+        assert result == {"action": "continue"}
+        assert attempted_models == ["doubao1.6", "doubao1.6"]
+        assert first_attempt_cancelled is True
+        assert _pop_prepared_segments("stream-stalled-segmentation", response_text) == [
+            "你自己打出来的字问我",
+            "装什么",
+            "这会儿倒开始纯了",
+            "不告诉你，自己百度",
+        ]
+    finally:
+        _reset_global_state()
+
+
+def test_maisaka_after_response_cancels_both_attempts_after_total_timeout() -> None:
+    """两次分段请求都卡住时必须取消请求并保持原文回退。"""
+    plugin = SmartSegmentationPlugin()
+    runtime_settings = {
+        "min_length": 1,
+        "max_segments": 8,
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "style": "natural",
+        "model_name": "doubao1.6",
+    }
+    response_text = "两个分段模型请求都卡住时，这条完整原文仍然必须安全发出去"
+
+    async def _run() -> tuple[dict[str, object], int, int]:
+        attempt_count = 0
+        cancelled_count = 0
+
+        async def _segment_text(*_args, **_kwargs):
+            nonlocal attempt_count, cancelled_count
+            attempt_count += 1
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled_count += 1
+                raise
+
+        with (
+            patch.object(plugin, "_get_segmentation_runtime_settings", AsyncMock(return_value=runtime_settings)),
+            patch.object(plugin, "_segment_text", AsyncMock(side_effect=_segment_text)),
+            patch.object(plugin_module, "_REPLYER_SEGMENT_RETRY_DELAY_SECONDS", 0.01),
+            patch.object(plugin_module, "_REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS", 0.04),
+        ):
+            result = await plugin.handle_maisaka_replyer_after_response(
+                response=response_text,
+                session_id="stream-double-timeout",
+            )
+            await asyncio.sleep(0)
+        return result, attempt_count, cancelled_count
+
+    _reset_global_state()
+    try:
+        result, attempt_count, cancelled_count = asyncio.run(_run())
+
+        assert result == {"action": "continue"}
+        assert attempt_count == 2
+        assert cancelled_count == 2
+        assert _pop_prepared_segments("stream-double-timeout", response_text) is None
+    finally:
+        _reset_global_state()
+
+
+def test_maisaka_after_response_delayed_retry_handles_randomized_texts() -> None:
+    """不同长度正文触发尾延迟重试时，都必须采用同模型返回的精确分段。"""
+    random_source = random.Random(20260727)
+    response_cases: list[tuple[str, list[str]]] = []
+    for _ in range(8):
+        left = "".join(random_source.choice("甲乙丙丁戊己庚辛壬癸") for _ in range(random_source.randint(1, 24)))
+        right = "".join(random_source.choice("春夏秋冬东西南北") for _ in range(random_source.randint(1, 24)))
+        response_cases.append((left + right, [left, right]))
+
+    async def _run() -> None:
+        plugin = SmartSegmentationPlugin()
+        runtime_settings = {
+            "min_length": 1,
+            "max_segments": 8,
+            "temperature": 0.3,
+            "max_tokens": 600,
+            "style": "natural",
+            "model_name": "doubao1.6",
+        }
+
+        for case_index, (response_text, expected_segments) in enumerate(response_cases):
+            attempt_count = 0
+
+            async def _segment_text(*_args, **_kwargs):
+                nonlocal attempt_count
+                attempt_count += 1
+                assert _kwargs["model_name"] == "doubao1.6"
+                if attempt_count == 1:
+                    await asyncio.Future()
+                return expected_segments
+
+            with (
+                patch.object(plugin, "_get_segmentation_runtime_settings", AsyncMock(return_value=runtime_settings)),
+                patch.object(plugin, "_segment_text", AsyncMock(side_effect=_segment_text)),
+                patch.object(plugin_module, "_REPLYER_SEGMENT_RETRY_DELAY_SECONDS", 0.001),
+                patch.object(plugin_module, "_REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS", 0.1),
+            ):
+                result = await plugin.handle_maisaka_replyer_after_response(
+                    response=response_text,
+                    session_id=f"stream-random-retry-{case_index}",
+                )
+
+            assert result == {"action": "continue"}
+            assert attempt_count == 2
+            assert _pop_prepared_segments(f"stream-random-retry-{case_index}", response_text) == expected_segments
+
+    _reset_global_state()
+    try:
+        asyncio.run(_run())
+    finally:
+        _reset_global_state()
+
+
 def test_maisaka_after_response_skips_during_active_command() -> None:
     """命令期间不应做早期预分段，避免占用 LLM 配额做没意义的工作。"""
     plugin = SmartSegmentationPlugin()
@@ -680,9 +1422,7 @@ def test_maisaka_after_response_skips_during_active_command() -> None:
         "max_tokens": 600,
         "style": "natural",
         "model_name": "",
-        "delay_base": 0.35,
-        "delay_per_char": 0.015,
-        "delay_max": 1.2,
+        "typing_enabled": True,
     }
     segment_text_mock = AsyncMock(return_value=["不应被调用"])
 
@@ -706,6 +1446,23 @@ def test_maisaka_after_response_skips_during_active_command() -> None:
         _reset_global_state()
 
 
+def test_active_command_marker_expires_if_after_execute_hook_never_arrives() -> None:
+    """宿主漏掉 after_execute 时，命令标记不能永久禁用该流的智能分段。"""
+    _reset_global_state()
+    stream_id = "stream-lost-command-hook"
+    try:
+        with patch.object(plugin_module.time, "monotonic", return_value=0.0):
+            _mark_command_stream_active(stream_id)
+            assert _is_command_stream_active(stream_id)
+
+        with patch.object(plugin_module.time, "monotonic", return_value=24 * 60 * 60.0):
+            assert not _is_command_stream_active(stream_id)
+
+        assert stream_id not in plugin_module._active_command_streams
+    finally:
+        _reset_global_state()
+
+
 def test_maisaka_after_response_skips_when_text_too_short() -> None:
     plugin = SmartSegmentationPlugin()
     runtime_settings = {
@@ -715,9 +1472,7 @@ def test_maisaka_after_response_skips_when_text_too_short() -> None:
         "max_tokens": 600,
         "style": "natural",
         "model_name": "",
-        "delay_base": 0.35,
-        "delay_per_char": 0.015,
-        "delay_max": 1.2,
+        "typing_enabled": True,
     }
     segment_text_mock = AsyncMock(return_value=["不应被调用"])
 
@@ -785,6 +1540,27 @@ def test_grace_window_remaining_expires_without_renewal() -> None:
         with patch.object(plugin_module.time, "monotonic", return_value=_COMMAND_REPLY_GRACE_SECONDS + 1.0):
             assert _get_command_stream_grace_remaining(stream_id) is None
         assert stream_id not in plugin_module._recent_command_stream_expiries
+    finally:
+        _reset_global_state()
+
+
+def test_new_command_prunes_expired_grace_windows_from_other_streams() -> None:
+    """不同聊天流持续执行命令时，过期保护窗口不能无界累积。"""
+    _reset_global_state()
+    try:
+        with patch.object(plugin_module.time, "monotonic", return_value=0.0):
+            _mark_command_stream_active("stream-expired-command")
+            _mark_command_stream_inactive("stream-expired-command")
+
+        with patch.object(
+            plugin_module.time,
+            "monotonic",
+            return_value=_COMMAND_REPLY_GRACE_SECONDS + 1.0,
+        ):
+            _mark_command_stream_active("stream-current-command")
+
+        assert "stream-expired-command" not in plugin_module._recent_command_stream_expiries
+        assert "stream-current-command" in plugin_module._recent_command_stream_expiries
     finally:
         _reset_global_state()
 
@@ -906,6 +1682,185 @@ def test_segment_text_recovers_when_model_splits_brackets() -> None:
     assert segments == ["你好啊", "（理理缓缓起身）", "今天怎么样"]
 
 
+def test_segment_text_keeps_model_bracket_width_without_content_validation() -> None:
+    plugin = SmartSegmentationPlugin()
+    original_text = (
+        "谁害羞了！\n\n"
+        "（拍他手，没拍开）\n\n"
+        "你别捏了  还疼着呢\n\n"
+        "昨晚被你揉了一整晚还不够吗\n\n"
+        "（声音闷在枕头里）\n\n"
+        "久远哥你够了\n\n"
+        "我要起床了\n\n"
+        "……你再捏我真踹你下床"
+    )
+    ctx_mock = MagicMock()
+    ctx_mock.llm.generate = AsyncMock(
+        return_value={
+            "success": True,
+            "response": (
+                '["谁害羞了！", "(拍他手，没拍开)", "你别捏了", "还疼着呢", '
+                '"昨晚被你揉了一整晚还不够吗", "(声音闷在枕头里)", '
+                '"久远哥你够了", "我要起床了", "……你再捏我真踹你下床"]'
+            ),
+            "model_name": "test-model",
+        }
+    )
+    plugin._ctx = ctx_mock
+
+    with patch.object(
+        plugin,
+        "_resolve_generation_model",
+        AsyncMock(return_value=("task", "")),
+    ):
+        segments = asyncio.run(
+            plugin._segment_text(
+                original_text,
+                style="natural",
+                model_name="",
+                max_segments=8,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+
+    assert segments == [
+        "谁害羞了！",
+        "(拍他手，没拍开)",
+        "你别捏了",
+        "还疼着呢",
+        "昨晚被你揉了一整晚还不够吗",
+        "(声音闷在枕头里)",
+        "久远哥你够了",
+        "我要起床了……你再捏我真踹你下床",
+    ]
+
+
+def test_segment_text_accepts_standalone_pause_omitted_by_model() -> None:
+    plugin = SmartSegmentationPlugin()
+    original_text = (
+        "……\n\n"
+        "你能不能别问这种明知故问的问题\n\n"
+        "腿都抖了一整天了你说呢\n\n"
+        "但是寸止那个真的过分\n\n"
+        "下次再那样我咬你"
+    )
+    ctx_mock = MagicMock()
+    ctx_mock.llm.generate = AsyncMock(
+        return_value={
+            "success": True,
+            "response": (
+                '["你能不能别问这种明知故问的问题", "腿都抖了一整天了你说呢", '
+                '"但是寸止那个真的过分", "下次再那样我咬你"]'
+            ),
+            "model_name": "test-model",
+        }
+    )
+    plugin._ctx = ctx_mock
+
+    with patch.object(
+        plugin,
+        "_resolve_generation_model",
+        AsyncMock(return_value=("task", "")),
+    ):
+        segments = asyncio.run(
+            plugin._segment_text(
+                original_text,
+                style="natural",
+                model_name="",
+                max_segments=16,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+
+    assert segments == [
+        "你能不能别问这种明知故问的问题",
+        "腿都抖了一整天了你说呢",
+        "但是寸止那个真的过分",
+        "下次再那样我咬你",
+    ]
+
+
+def test_segment_text_merges_model_overflow_without_restoring_original_punctuation() -> None:
+    plugin = SmartSegmentationPlugin()
+    ctx_mock = MagicMock()
+    ctx_mock.llm.generate = AsyncMock(
+        return_value={
+            "success": True,
+            "response": '["甲", "乙", "丙"]',
+            "model_name": "test-model",
+        }
+    )
+    plugin._ctx = ctx_mock
+
+    with patch.object(
+        plugin,
+        "_resolve_generation_model",
+        AsyncMock(return_value=("task", "")),
+    ):
+        segments = asyncio.run(
+            plugin._segment_text(
+                "甲，乙，丙",
+                style="natural",
+                model_name="",
+                max_segments=2,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+
+    assert segments == ["甲", "乙丙"]
+
+
+def test_segment_text_safely_rejects_unexpected_llm_result_shape() -> None:
+    plugin = SmartSegmentationPlugin()
+    ctx_mock = MagicMock()
+    ctx_mock.llm.generate = AsyncMock(return_value=["不是宿主约定的结果对象"])
+    plugin._ctx = ctx_mock
+
+    with patch.object(
+        plugin,
+        "_resolve_generation_model",
+        AsyncMock(return_value=("task", "")),
+    ):
+        segments = asyncio.run(
+            plugin._segment_text(
+                "这是一段等待分段的完整正文",
+                style="natural",
+                model_name="",
+                max_segments=8,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+
+    assert segments is None
+
+
+def test_segment_text_safely_handles_model_resolution_failure() -> None:
+    plugin = SmartSegmentationPlugin()
+    plugin._ctx = MagicMock()
+
+    with patch.object(
+        plugin,
+        "_resolve_generation_model",
+        AsyncMock(side_effect=RuntimeError("model config unavailable")),
+    ):
+        segments = asyncio.run(
+            plugin._segment_text(
+                "这是一段等待分段的完整正文",
+                style="natural",
+                model_name="",
+                max_segments=8,
+                temperature=0.3,
+                max_tokens=600,
+            )
+        )
+
+    assert segments is None
+
+
 def test_split_text_at_brackets_extracts_bracketed_blocks() -> None:
     assert _split_text_at_brackets("你好啊（理理缓缓起身）今天怎么样") == [
         "你好啊",
@@ -961,9 +1916,7 @@ def test_maisaka_after_response_skips_action_only_text() -> None:
         "max_tokens": 600,
         "style": "natural",
         "model_name": "",
-        "delay_base": 0.35,
-        "delay_per_char": 0.015,
-        "delay_max": 1.2,
+        "typing_enabled": True,
     }
     segment_text_mock = AsyncMock(return_value=["不应被调用"])
 
@@ -997,246 +1950,33 @@ def test_build_segmentation_prompt_mentions_bracket_rule() -> None:
     assert "独立" in prompt
 
 
-def test_presync_follow_up_segments_appends_clones_to_maisaka_history() -> None:
-    """预先同步剩余段进 maisaka._chat_history：每段克隆首段 SessionMessage，
-    改写 raw_message / processed_plain_text / message_id 后调
-    ``runtime.append_sent_message_to_chat_history``。
-    """
-    _reset_global_state()
-
-    # 构造一个最小的可被 deserialize_session_message 接受的 message dict。
-    # 字段参考 PluginMessageUtils._session_message_to_dict 的产物。
-    first_message_dict = {
-        "message_id": "platform-msg-9001",
-        "session_id": "stream-presync",
-        "timestamp": "2026-05-29T08:00:00",
-        "platform": "qq",
-        "is_at": False,
-        "is_emoji": False,
-        "is_picture": False,
-        "is_command": False,
-        "is_mentioned": False,
-        "is_notify": False,
-        "processed_plain_text": "首段",
-        "raw_message": [{"type": "text", "data": "首段"}],
-        "message_info": {
-            "user_info": {
-                "user_id": "10001",
-                "user_nickname": "理理",
-                "user_cardname": "理理",
-            },
-            "group_info": {
-                "group_id": "20001",
-                "group_name": "测试群",
-            },
-            "additional_config": {},
-        },
-    }
-
-    appended: list[tuple[Any, str]] = []
-
-    class _FakeRuntime:
-        def append_sent_message_to_chat_history(self, message, *, source_kind="guided_reply"):
-            appended.append((message, source_kind))
-            return True
-
-    fake_runtime = _FakeRuntime()
-
-    class _FakeHeartflowManager:
-        heartflow_chat_list = {"stream-presync": fake_runtime}
-
-    fake_manager = _FakeHeartflowManager()
-
-    # _presync_follow_up_segments_to_maisaka_history 内部用 from src... import 拿
-    # heartflow_manager，patch 必须落到目标模块属性。
-    import importlib
-
-    heartflow_module = importlib.import_module("src.chat.heart_flow.heartflow_manager")
-
-    try:
-        with patch.object(heartflow_module, "heartflow_manager", fake_manager):
-            ok = plugin_module._presync_follow_up_segments_to_maisaka_history(
-                stream_id="stream-presync",
-                first_message_dict=first_message_dict,
-                follow_up_segments=["段二", "段三"],
-            )
-
-        assert ok is True
-        assert len(appended) == 2
-
-        first_clone, first_source = appended[0]
-        # 必须改写文本，避免后续段拿到首段同样的内容
-        assert first_clone.processed_plain_text == "段二"
-        assert [c.text for c in first_clone.raw_message.components] == ["段二"]
-        # message_id 必须与首段不同，且与下一段也不同，避免合并/去重
-        assert first_clone.message_id != "platform-msg-9001"
-        # source_kind 必须是 guided_reply，沿用 maisaka 自己 reply 工具的语义
-        assert first_source == "guided_reply"
-
-        second_clone, _ = appended[1]
-        assert second_clone.processed_plain_text == "段三"
-        assert second_clone.message_id != first_clone.message_id
-        # message_info 应该跟首段保持一致（同一用户/群）
-        assert second_clone.message_info.user_info.user_id == "10001"
-        assert second_clone.message_info.group_info.group_id == "20001"
-    finally:
-        _reset_global_state()
-
-
-def test_presync_returns_false_when_runtime_missing_so_send_falls_back_to_sync_history() -> None:
-    """maisaka runtime 不存在时（例如插件 reload 中途）必须返回 False，
-    让 _run_follow_up_segments 退回到老的"send_service 同步入库"路径，
-    避免后续段在 maisaka 历史中彻底丢失。"""
-    _reset_global_state()
-
-    class _EmptyHeartflowManager:
-        heartflow_chat_list: dict[str, Any] = {}
-
-    import importlib
-
-    heartflow_module = importlib.import_module("src.chat.heart_flow.heartflow_manager")
-
-    first_message_dict = {
-        "message_id": "platform-msg-9100",
-        "session_id": "stream-missing",
-        "timestamp": "2026-05-29T08:01:00",
-        "platform": "qq",
-        "is_at": False,
-        "is_emoji": False,
-        "is_picture": False,
-        "is_command": False,
-        "is_mentioned": False,
-        "is_notify": False,
-        "processed_plain_text": "首段",
-        "raw_message": [{"type": "text", "data": "首段"}],
-        "message_info": {
-            "user_info": {"user_id": "10001", "user_nickname": "理理", "user_cardname": "理理"},
-            "group_info": {"group_id": "20001", "group_name": "群"},
-            "additional_config": {},
-        },
-    }
-
-    with patch.object(heartflow_module, "heartflow_manager", _EmptyHeartflowManager()):
-        ok = plugin_module._presync_follow_up_segments_to_maisaka_history(
-            stream_id="stream-missing",
-            first_message_dict=first_message_dict,
-            follow_up_segments=["段二"],
-        )
-    assert ok is False
-
-
-def test_after_send_disables_send_service_history_sync_when_presync_succeeded() -> None:
-    """端到端：after_send 命中 pending 后预同步成功 → 后台发送禁用
-    send_service 的 sync_to_maisaka_history，避免每段被记两次。
-    """
-    _reset_global_state()
-    plugin = SmartSegmentationPlugin()
-
-    tracking_key = plugin_module._build_follow_up_tracking_key(
-        stream_id="stream-e2e-presync",
-        timestamp="2026-05-29T09:00:00",
-        visible_text="首段",
-    )
-    plugin_module._register_pending_follow_up_segments(
-        lookup_keys=["msg-e2e", tracking_key],
-        pending_data={
-            "stream_id": "stream-e2e-presync",
-            "segments": ["段二", "段三"],
-            "delay_base": 0.0,
-            "delay_per_char": 0.0,
-            "delay_max": 0.0,
-        },
+def test_segmentation_prompt_stays_compact_without_losing_natural_chat_calibration() -> None:
+    text = "不是你先别急，我刚刚看了一下，应该只是配置没有生效，重启一下插件再试试。"
+    prompt = SmartSegmentationPlugin._build_segmentation_prompt(
+        text,
+        style="natural",
+        max_segments=16,
     )
 
-    appended_to_history: list[Any] = []
-
-    class _FakeRuntime:
-        def append_sent_message_to_chat_history(self, message, *, source_kind="guided_reply"):
-            appended_to_history.append(message)
-            return True
-
-    class _FakeHeartflowManager:
-        heartflow_chat_list = {"stream-e2e-presync": _FakeRuntime()}
-
-    import importlib
-
-    heartflow_module = importlib.import_module("src.chat.heart_flow.heartflow_manager")
-
-    send_segments_mock = AsyncMock(return_value=True)
-
-    async def _run() -> None:
-        with patch.object(heartflow_module, "heartflow_manager", _FakeHeartflowManager()):
-            with patch.object(plugin, "_send_segments", send_segments_mock):
-                await plugin.handle_smart_segmentation_after_send(
-                    message={
-                        "message_id": "msg-e2e",
-                        "session_id": "stream-e2e-presync",
-                        "timestamp": "2026-05-29T09:00:00",
-                        "platform": "qq",
-                        "is_at": False,
-                        "is_emoji": False,
-                        "is_picture": False,
-                        "is_command": False,
-                        "is_mentioned": False,
-                        "is_notify": False,
-                        "processed_plain_text": "首段",
-                        "raw_message": [{"type": "text", "data": "首段"}],
-                        "message_info": {
-                            "user_info": {
-                                "user_id": "10001",
-                                "user_nickname": "理理",
-                                "user_cardname": "理理",
-                            },
-                            "group_info": {"group_id": "20001", "group_name": "群"},
-                            "additional_config": {},
-                        },
-                    },
-                    sent=True,
-                )
-                await plugin_module._drain_active_follow_up_tasks()
-
-    try:
-        asyncio.run(_run())
-
-        # 1) 预同步把全部剩余段写进了 maisaka 历史（共 2 段）
-        assert len(appended_to_history) == 2
-        assert [m.processed_plain_text for m in appended_to_history] == ["段二", "段三"]
-
-        # 2) 后台 _send_segments 被 sync_to_maisaka_history=False 调用——避免重复入库
-        send_segments_mock.assert_awaited_once()
-        call_kwargs = send_segments_mock.await_args.kwargs
-        assert call_kwargs["sync_to_maisaka_history"] is False
-        # 但 segments 内容与 delays 没被改
-        assert send_segments_mock.await_args.args == ("stream-e2e-presync", ["段二", "段三"])
-        assert call_kwargs["delay_before_first"] is True
-    finally:
-        _reset_global_state()
+    assert "像和朋友微信聊天一样自然地分条发送。有的消息短有的长，节奏随意。" in prompt
+    assert "相关的内容放在一条里" in prompt
+    assert "长短" in prompt and "不均匀" in prompt
+    assert '["哈哈真的吗", "那太好了！我还以为你不喜欢呢", "下次我们一起去看电影吧，最近有个新片子挺有意思的"]' in prompt
+    assert "不要改写原意" in prompt
+    assert "最多分成 16 条" in prompt
+    assert "通常建议分成" not in prompt
+    assert "即时反应、转折、补充说明、问题、建议和收尾" not in prompt
+    assert len(prompt) - len(text) <= 520
 
 
-def test_send_segments_honors_sync_to_maisaka_history_false() -> None:
-    """关闭 sync_to_maisaka_history 时，发送链调用必须把这个参数透传下去，
-    否则即使上层走了预同步路径，下层依然会走 send_service 入库，造成重复。"""
-    plugin = SmartSegmentationPlugin()
-    send_text_mock = AsyncMock(return_value=True)
-    mock_ctx = MagicMock()
-    mock_ctx.send = MagicMock()
-    mock_ctx.send.text = send_text_mock
-    plugin._ctx = mock_ctx
+def test_segmentation_prompt_calibrates_clear_boundaries_without_punctuation() -> None:
+    prompt = SmartSegmentationPlugin._build_segmentation_prompt(
+        "你买早饭我到了要吃的",
+        style="natural",
+        max_segments=16,
+    )
 
-    with patch.object(plugin_module.asyncio, "sleep", AsyncMock()):
-        ok = asyncio.run(
-            plugin._send_segments(
-                "stream-no-sync",
-                ["段一", "段二"],
-                delay_base=0.0,
-                delay_per_char=0.0,
-                delay_max=0.0,
-                sync_to_maisaka_history=False,
-            )
-        )
-
-    assert ok is True
-    assert send_text_mock.await_count == 2
-    for call in send_text_mock.await_args_list:
-        assert call.kwargs.get("sync_to_maisaka_history") is False
-        assert call.kwargs.get("maisaka_source_kind") == "guided_reply"
+    assert "原文没有标点" in prompt
+    assert "明显的自然发送边界" in prompt
+    assert '原文："你买早饭我到了要吃的"' in prompt
+    assert '分条：["你买早饭", "我到了要吃的"]' in prompt

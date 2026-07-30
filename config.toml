@@ -1,5 +1,5 @@
 # smart_segmentation_plugin - 智能分段插件配置文件
-# 使用 LLM 智能切分回复文本，保持内容不变
+# 使用 LLM 智能切分回复文本
 
 # ⚠️ 重要：必须禁用 MaiBot 内置分段功能！
 # 在 config/bot_config.toml 中设置：
@@ -13,10 +13,10 @@
 name = "smart_segmentation_plugin"
 
 # 配置文件版本
-config_version = "1.0.0"
+config_version = "1.1.0"
 
 # 插件版本
-version = "1.0.0"
+version = "1.1.0"
 
 # 是否启用插件
 enabled = true
@@ -45,5 +45,11 @@ style = "natural"
 min_length = 3
 
 # 最大切分段数
-# 避免长文切分过多导致刷屏
+# 避免长文切分过多导致刷屏；可按需要自定义
 max_segments = 16
+
+# 是否为后续分段启用宿主模拟打字等待
+typing_enabled = true
+
+# 开启后，等待速度复用宿主 config/bot_config.toml 中的
+# response_post_process.typing_speed；旧版 delay_* 配置键已被忽略

@@ -75,24 +75,40 @@ _PREPARED_SEGMENT_TTL_SECONDS = 60.0
 _pending_follow_up_segments: dict[str, dict[str, Any]] = {}
 _PENDING_FOLLOW_UP_TTL_SECONDS = 60.0
 
+# 补发必须脱离宿主 after_send 的固定超时，同时保留强引用，避免后台 Task 被回收。
+_active_follow_up_tasks: set[asyncio.Task[Any]] = set()
+_active_follow_up_tasks_by_stream: dict[str, set[asyncio.Task[Any]]] = {}
+_follow_up_idle_events_by_stream: dict[str, asyncio.Event] = {}
+
+# planner 可能在补发历史写入前构建好 prompt；按流保留一次性修补信息和完成屏障。
+_planner_follow_up_entries_by_stream: dict[str, list[dict[str, Any]]] = {}
 
 # 插件自身补发时关闭二次分段
 _stream_resend_guards: dict[str, int] = {}
 
 # 命令执行期间禁止把命令回执误判为主回复
 _active_command_streams: dict[str, int] = {}
+_active_command_stream_expiries: dict[str, float] = {}
 _recent_command_stream_expiries: dict[str, float] = {}
 # 仅兜住命令 hook 与 send_service 之间的轻微异步抖动。值过大会把命令后紧跟的正常主回复一起误伤
 # (旧 90s 窗口就出现过重启后首个 @ 回复不分段的回归)，1.0s 已经足够覆盖 IPC 微抖动，
 # 同时把误伤窗口比之前的 2.0s 缩短一半。
 _COMMAND_REPLY_GRACE_SECONDS = 1.0
+_ACTIVE_COMMAND_STREAM_TTL_SECONDS = 300.0
 
 # maisaka 早期路径自己的 LLM 超时；这是当前唯一会做分段 LLM 调用的入口。
-_REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS = 12.0
+_REPLYER_SEGMENT_RETRY_DELAY_SECONDS = 6.0
+_REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS = 20.0
+_REPLYER_HOOK_TIMEOUT_MS = 25_000
+_DEFAULT_MAX_SEGMENTS = 8
 
-# send_service.after_send 宿主默认强制 5000ms 超时；即发即同步在该阻塞窗口里连发多段会
-# 超过这个上限，这里用 handler 级 timeout_ms 显式放宽，避免连发被宿主 cancel 丢尾段。
-_AFTER_SEND_FOLLOW_UP_TIMEOUT_MS = 30_000
+# 新消息进入同一聊天流时，最多等待正在补发的分段两分钟，避免两轮消息交错。
+_FOLLOW_UP_WAIT_TIMEOUT_MS = 120_000
+_FOLLOW_UP_WAIT_TIMEOUT_SECONDS = (_FOLLOW_UP_WAIT_TIMEOUT_MS - 5_000) / 1000
+_FIRST_SEND_OBSERVE_GRACE_SECONDS = 5.0
+_SEND_SEGMENT_RPC_TIMEOUT_MS = _FOLLOW_UP_WAIT_TIMEOUT_MS
+_FOLLOW_UP_SEND_MAX_ATTEMPTS = 2
+_FOLLOW_UP_UNLOAD_GRACE_SECONDS = 1.0
 
 
 class _PinnedTaskLLMOrchestrator(LLMOrchestrator):
@@ -118,8 +134,8 @@ class PluginSectionConfig(PluginConfigBase):
     """插件基础配置。"""
 
     name: str = Field(default="smart_segmentation_plugin", description="插件名称")
-    config_version: str = Field(default="1.0.0", description="配置文件版本")
-    version: str = Field(default="1.0.0", description="插件版本")
+    config_version: str = Field(default="1.1.0", description="配置文件版本")
+    version: str = Field(default="1.1.0", description="插件版本")
     enabled: bool = Field(default=True, description="是否启用插件")
 
 
@@ -133,9 +149,7 @@ class SegmentationSectionConfig(PluginConfigBase):
     max_segments: int = Field(default=8, description="最大分段数量")
     temperature: float = Field(default=0.3, description="分段模型温度")
     max_tokens: int = Field(default=600, description="分段模型最大输出 token")
-    delay_base: float = Field(default=0.35, description="分段消息基础发送间隔（秒）")
-    delay_per_char: float = Field(default=0.015, description="按字数增加的发送间隔（秒）")
-    delay_max: float = Field(default=1.2, description="单段消息最大发送间隔（秒）")
+    typing_enabled: bool = Field(default=True, description="是否为后续分段启用宿主模拟打字等待")
 
 
 class SmartSegmentationConfig(PluginConfigBase):
@@ -497,6 +511,16 @@ def _pop_prepared_segments(stream_id: str, outbound_text: str) -> list[str] | No
     return list(segments)
 
 
+def _has_prepared_segments(stream_id: str, response_text: str) -> bool:
+    """检查回复是否存在精确匹配的预分段缓存，但不消费缓存。"""
+    _prune_expired_prepared_segments()
+    normalized_stream_id = str(stream_id or "").strip()
+    text_hash = _hash_normalized_text(response_text)
+    if not normalized_stream_id or not text_hash:
+        return False
+    return (normalized_stream_id, text_hash) in _prepared_segment_registry
+
+
 def _normalize_segments(segments: Any, *, max_segments: int) -> list[str]:
     """规范化模型返回的分段结果。"""
     if not isinstance(segments, list):
@@ -506,7 +530,10 @@ def _normalize_segments(segments: Any, *, max_segments: int) -> list[str]:
     if not normalized_segments:
         raise ValueError("模型返回的分段结果为空")
 
-    return normalized_segments[:max_segments]
+    if max_segments <= 0 or len(normalized_segments) <= max_segments:
+        return normalized_segments
+
+    return normalized_segments[: max_segments - 1] + ["".join(normalized_segments[max_segments - 1 :])]
 
 
 def _render_mention_component_text(component: dict[str, Any]) -> str:
@@ -581,6 +608,42 @@ def _extract_plain_text_outbound_message(message: dict[str, Any], processed_plai
     if text:
         return text
     return str(processed_plain_text or "").strip()
+
+
+def _extract_leading_mentions_and_text_body(message: dict[str, Any]) -> tuple[str, str] | None:
+    """识别宿主 rich reply 生成的 ``AtComponent... + TextComponent...`` 结构。"""
+    raw_components = message.get("raw_message")
+    if not isinstance(raw_components, list):
+        return None
+
+    mention_parts: list[str] = []
+    text_parts: list[str] = []
+    text_started = False
+    for component in raw_components:
+        if not isinstance(component, dict):
+            return None
+        component_type = str(component.get("type", "") or "").strip().lower()
+        if component_type == "reply":
+            continue
+        if _is_mention_component_type(component_type):
+            if text_started:
+                return None
+            mention_text = _render_mention_component_text(component)
+            if not mention_text:
+                return None
+            mention_parts.append(mention_text)
+            continue
+        if component_type == "text":
+            text_started = True
+            text_parts.append(str(component.get("data", "") or ""))
+            continue
+        return None
+
+    mention_prefix = "".join(mention_parts)
+    text_body = "".join(text_parts).strip()
+    if not mention_prefix or not text_body:
+        return None
+    return mention_prefix, text_body
 
 
 def _clone_message_component(component: dict[str, Any]) -> dict[str, Any]:
@@ -738,15 +801,278 @@ def _resolve_pending_follow_up_segments(*, message_id: Any, tracking_key: Any) -
     return None
 
 
+def _discard_pending_follow_up_for_planner_entry(entry: Any) -> None:
+    """首段未进入 after_send 时，清掉该回复仍占用的 pending 查找键。"""
+    if not isinstance(entry, dict):
+        return
+
+    cleanup_keys: list[str] = []
+    for lookup_key, pending_data in list(_pending_follow_up_segments.items()):
+        if pending_data.get("planner_entry") is not entry:
+            continue
+        raw_lookup_keys = pending_data.get("lookup_keys")
+        if isinstance(raw_lookup_keys, list):
+            cleanup_keys.extend(_normalize_pending_lookup_keys(*raw_lookup_keys))
+        else:
+            cleanup_keys.append(lookup_key)
+    for cleanup_key in cleanup_keys:
+        _pending_follow_up_segments.pop(cleanup_key, None)
+
+
+def _prune_expired_planner_follow_up_entries() -> None:
+    """清理所有聊天流中已过期的 Planner 补发状态。"""
+    if not _planner_follow_up_entries_by_stream:
+        return
+    now = time.monotonic()
+    for stream_id, entries in list(_planner_follow_up_entries_by_stream.items()):
+        active_entries = [entry for entry in entries if entry.get("expires_at", 0.0) > now]
+        if active_entries:
+            _planner_follow_up_entries_by_stream[stream_id] = active_entries
+        else:
+            _planner_follow_up_entries_by_stream.pop(stream_id, None)
+
+
+def _register_planner_follow_up_entry(*, stream_id: str, segments: list[str]) -> dict[str, Any]:
+    """登记当前回复，供紧邻的 planner 请求等待并修补已构建 prompt。"""
+    _prune_expired_planner_follow_up_entries()
+    entry = {
+        "segments": list(segments),
+        "after_send_started": asyncio.Event(),
+        "completed": asyncio.Event(),
+        "send_ok": False,
+        "expires_at": time.monotonic() + _PENDING_FOLLOW_UP_TTL_SECONDS,
+    }
+    _planner_follow_up_entries_by_stream.setdefault(stream_id, []).append(entry)
+    return entry
+
+
+def _mark_planner_follow_up_started(entry: Any) -> None:
+    if not isinstance(entry, dict):
+        return
+    started = entry.get("after_send_started")
+    if isinstance(started, asyncio.Event):
+        started.set()
+
+
+def _complete_planner_follow_up_entry(entry: Any, *, send_ok: bool) -> None:
+    if not isinstance(entry, dict):
+        return
+    entry["send_ok"] = bool(send_ok)
+    completed = entry.get("completed")
+    if isinstance(completed, asyncio.Event):
+        completed.set()
+
+
+async def _wait_for_planner_follow_up_entry(entry: dict[str, Any], *, stream_id: str) -> None:
+    """先等 after_send OBSERVE 到达，再等待实际补发完成。"""
+    completed = entry.get("completed")
+    if not isinstance(completed, asyncio.Event) or completed.is_set():
+        return
+
+    started = entry.get("after_send_started")
+    if isinstance(started, asyncio.Event) and not started.is_set():
+        try:
+            await asyncio.wait_for(
+                started.wait(),
+                timeout=_FIRST_SEND_OBSERVE_GRACE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            _discard_pending_follow_up_for_planner_entry(entry)
+            _complete_planner_follow_up_entry(entry, send_ok=False)
+            logger.error("首段发送未进入 after_send，已释放智能分段等待，stream_id=%s", stream_id)
+            return
+
+    if completed.is_set():
+        return
+    try:
+        await asyncio.wait_for(
+            completed.wait(),
+            timeout=_FOLLOW_UP_WAIT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error("等待智能分段补发完成超时，stream_id=%s", stream_id)
+
+
+def _pop_planner_follow_up_entries(stream_id: Any) -> list[dict[str, Any]]:
+    _prune_expired_planner_follow_up_entries()
+    normalized_stream_id = str(stream_id or "").strip()
+    if not normalized_stream_id:
+        return []
+    return _planner_follow_up_entries_by_stream.pop(normalized_stream_id, [])
+
+
+def _planner_message_body(content: str) -> str:
+    """提取 planner 中序列化聊天消息的正文。"""
+    header, separator, body = str(content or "").partition("\n")
+    if separator and header.lstrip().startswith("<message "):
+        return body
+    return ""
+
+
+def _repair_planner_messages(messages: list[Any], entries: list[dict[str, Any]]) -> list[Any]:
+    """把 prompt 中仅可见首段的自身消息替换为本次完整分段文本。"""
+    repaired_messages = [dict(message) if isinstance(message, dict) else message for message in messages]
+    for entry in entries:
+        segments = entry.get("segments")
+        if not entry.get("send_ok") or not isinstance(segments, list) or len(segments) <= 1:
+            continue
+        normalized_segments = [str(segment) for segment in segments]
+        first_segment = normalized_segments[0]
+        candidate_index = -1
+        for index in range(len(repaired_messages) - 1, -1, -1):
+            message = repaired_messages[index]
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and _planner_message_body(content) == first_segment:
+                candidate_index = index
+                break
+        if candidate_index < 0:
+            continue
+
+        matched_tail_indices: list[int] = []
+        next_index = candidate_index + 1
+        for tail_segment in normalized_segments[1:]:
+            if next_index >= len(repaired_messages):
+                break
+            next_message = repaired_messages[next_index]
+            if not isinstance(next_message, dict) or next_message.get("role") != "user":
+                break
+            next_content = next_message.get("content")
+            if not isinstance(next_content, str) or _planner_message_body(next_content) != tail_segment:
+                break
+            matched_tail_indices.append(next_index)
+            next_index += 1
+
+        if len(matched_tail_indices) == len(normalized_segments) - 1:
+            continue
+
+        candidate = repaired_messages[candidate_index]
+        original_content = str(candidate.get("content") or "")
+        header = original_content.split("\n", 1)[0]
+        joined_segments = "\n".join(normalized_segments)
+        candidate["content"] = f"{header}\n{joined_segments}"
+        for index in reversed(matched_tail_indices):
+            repaired_messages.pop(index)
+    return repaired_messages
+
+
+# === 后台补发任务 ===
+def _get_follow_up_idle_event(stream_id: Any) -> asyncio.Event:
+    """返回聊天流的补发空闲事件。"""
+    normalized_stream_id = str(stream_id or "").strip()
+    idle_event = _follow_up_idle_events_by_stream.get(normalized_stream_id)
+    if idle_event is None:
+        idle_event = asyncio.Event()
+        idle_event.set()
+        if normalized_stream_id:
+            _follow_up_idle_events_by_stream[normalized_stream_id] = idle_event
+    return idle_event
+
+
+def _release_follow_up_idle_event(stream_id: Any) -> None:
+    """释放并移除聊天流的补发空闲事件。"""
+    normalized_stream_id = str(stream_id or "").strip()
+    if not normalized_stream_id:
+        return
+    idle_event = _follow_up_idle_events_by_stream.pop(normalized_stream_id, None)
+    if idle_event is not None:
+        idle_event.set()
+
+
+def _get_active_follow_up_task_count(stream_id: Any) -> int:
+    """返回聊天流仍在运行的补发任务数。"""
+    normalized_stream_id = str(stream_id or "").strip()
+    stream_tasks = _active_follow_up_tasks_by_stream.get(normalized_stream_id)
+    if not normalized_stream_id or not stream_tasks:
+        return 0
+
+    pending_tasks = {task for task in stream_tasks if not task.done()}
+    if pending_tasks:
+        _active_follow_up_tasks_by_stream[normalized_stream_id] = pending_tasks
+        return len(pending_tasks)
+
+    _active_follow_up_tasks_by_stream.pop(normalized_stream_id, None)
+    _release_follow_up_idle_event(normalized_stream_id)
+    return 0
+
+
+async def _wait_for_stream_follow_up_tasks(stream_id: Any) -> int:
+    """等待聊天流的后台补发结束，并返回等待前的任务数。"""
+    pending_task_count = _get_active_follow_up_task_count(stream_id)
+    if pending_task_count > 0:
+        await _get_follow_up_idle_event(stream_id).wait()
+    return pending_task_count
+
+
+def _track_follow_up_task(task: asyncio.Task[Any], *, stream_id: Any) -> None:
+    """持有后台补发任务，并在任务结束时释放聊天流。"""
+    _active_follow_up_tasks.add(task)
+    normalized_stream_id = str(stream_id or "").strip()
+    if normalized_stream_id:
+        _active_follow_up_tasks_by_stream.setdefault(normalized_stream_id, set()).add(task)
+        _get_follow_up_idle_event(normalized_stream_id).clear()
+
+    def _cleanup(completed_task: asyncio.Task[Any]) -> None:
+        _active_follow_up_tasks.discard(completed_task)
+        if not normalized_stream_id:
+            return
+        stream_tasks = _active_follow_up_tasks_by_stream.get(normalized_stream_id)
+        if stream_tasks is not None:
+            stream_tasks.discard(completed_task)
+            if stream_tasks:
+                return
+            _active_follow_up_tasks_by_stream.pop(normalized_stream_id, None)
+        _release_follow_up_idle_event(normalized_stream_id)
+
+    task.add_done_callback(_cleanup)
+
+
+async def _drain_active_follow_up_tasks() -> None:
+    """等待所有后台补发任务结束，供卸载流程和测试使用。"""
+    pending_tasks = [task for task in _active_follow_up_tasks if not task.done()]
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+
 # === 命令保护窗口 ===
+
+def _prune_expired_recent_command_streams(*, now: float | None = None) -> float:
+    """清理所有聊天流中过期的命令回执保护窗口。"""
+    current_time = time.monotonic() if now is None else now
+    expired_stream_ids = [
+        stream_id
+        for stream_id, expires_at in _recent_command_stream_expiries.items()
+        if expires_at <= current_time
+    ]
+    for stream_id in expired_stream_ids:
+        _recent_command_stream_expiries.pop(stream_id, None)
+    return current_time
+
+
+def _prune_expired_active_command_streams(*, now: float) -> None:
+    """回收未收到 after_execute 的失联命令标记。"""
+    expired_stream_ids = [
+        stream_id
+        for stream_id, expires_at in _active_command_stream_expiries.items()
+        if expires_at <= now
+    ]
+    for stream_id in expired_stream_ids:
+        _active_command_streams.pop(stream_id, None)
+        _active_command_stream_expiries.pop(stream_id, None)
+        logger.warning("命令执行标记超时，已恢复智能分段 stream_id=%s", stream_id)
+
 
 def _mark_command_stream_active(stream_id: Any) -> None:
     """标记当前聊天流正在执行命令。"""
     normalized_stream_id = str(stream_id or "").strip()
     if not normalized_stream_id:
         return
+    now = _prune_expired_recent_command_streams()
+    _prune_expired_active_command_streams(now=now)
     _active_command_streams[normalized_stream_id] = _active_command_streams.get(normalized_stream_id, 0) + 1
-    _recent_command_stream_expiries[normalized_stream_id] = time.monotonic() + _COMMAND_REPLY_GRACE_SECONDS
+    _active_command_stream_expiries[normalized_stream_id] = now + _ACTIVE_COMMAND_STREAM_TTL_SECONDS
+    _recent_command_stream_expiries[normalized_stream_id] = now + _COMMAND_REPLY_GRACE_SECONDS
 
 
 def _mark_command_stream_inactive(stream_id: Any) -> None:
@@ -759,6 +1085,7 @@ def _mark_command_stream_inactive(stream_id: Any) -> None:
         _active_command_streams[normalized_stream_id] = remaining
     else:
         _active_command_streams.pop(normalized_stream_id, None)
+        _active_command_stream_expiries.pop(normalized_stream_id, None)
     # 故意不在命令结束时续期：before_execute 设定的短窗口足够覆盖回执同步发送，
     # 再次续期会把命令结束后的正常业务主回复一起挡住。
 
@@ -768,6 +1095,7 @@ def _is_command_stream_active(stream_id: Any) -> bool:
     normalized_stream_id = str(stream_id or "").strip()
     if not normalized_stream_id:
         return False
+    _prune_expired_active_command_streams(now=time.monotonic())
     return _active_command_streams.get(normalized_stream_id, 0) > 0
 
 
@@ -777,15 +1105,12 @@ def _get_command_stream_grace_remaining(stream_id: Any) -> float | None:
     if not normalized_stream_id:
         return None
 
+    now = _prune_expired_recent_command_streams()
     expires_at = _recent_command_stream_expiries.get(normalized_stream_id)
     if expires_at is None:
         return None
 
-    remaining = expires_at - time.monotonic()
-    if remaining <= 0:
-        _recent_command_stream_expiries.pop(normalized_stream_id, None)
-        return None
-    return remaining
+    return expires_at - now
 
 
 def _is_stream_guarded(stream_id: str) -> bool:
@@ -866,22 +1191,41 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         """处理插件加载。"""
         _prepared_segment_registry.clear()
         _pending_follow_up_segments.clear()
+        _active_follow_up_tasks.clear()
+        _active_follow_up_tasks_by_stream.clear()
+        _follow_up_idle_events_by_stream.clear()
+        _planner_follow_up_entries_by_stream.clear()
         _stream_resend_guards.clear()
         _active_command_streams.clear()
+        _active_command_stream_expiries.clear()
         _recent_command_stream_expiries.clear()
         if not _SDK_HOOK_HANDLER_AVAILABLE:
             logger.info("当前 maibot_sdk 未导出 HookHandler，智能分段已启用内置 hook_handler 声明兼容")
 
     async def on_unload(self) -> None:
-        """处理插件卸载。
-
-        即发即同步后不再有后台补发任务：补发已在 after_send 的阻塞窗口里同步完成。
-        """
-        _prepared_segment_registry.clear()
-        _pending_follow_up_segments.clear()
-        _stream_resend_guards.clear()
-        _active_command_streams.clear()
-        _recent_command_stream_expiries.clear()
+        """处理插件卸载，短暂等待正在发送的尾段后再取消。"""
+        pending_tasks = [task for task in _active_follow_up_tasks if not task.done()]
+        try:
+            if pending_tasks:
+                await asyncio.wait(pending_tasks, timeout=_FOLLOW_UP_UNLOAD_GRACE_SECONDS)
+        finally:
+            remaining_tasks = [task for task in _active_follow_up_tasks if not task.done()]
+            for task in remaining_tasks:
+                task.cancel()
+            try:
+                if remaining_tasks:
+                    await asyncio.gather(*remaining_tasks, return_exceptions=True)
+            finally:
+                _prepared_segment_registry.clear()
+                _pending_follow_up_segments.clear()
+                _active_follow_up_tasks.clear()
+                _active_follow_up_tasks_by_stream.clear()
+                _follow_up_idle_events_by_stream.clear()
+                _planner_follow_up_entries_by_stream.clear()
+                _stream_resend_guards.clear()
+                _active_command_streams.clear()
+                _active_command_stream_expiries.clear()
+                _recent_command_stream_expiries.clear()
 
     def _load_local_config_fallback(self) -> dict[str, Any]:
         """回退读取插件目录下的 `config.toml`，按 mtime 缓存。"""
@@ -921,11 +1265,6 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         if not isinstance(runtime_config, dict):
             return local_config
         return _merge_config_dicts(local_config, runtime_config)
-
-    async def _get_config_value(self, key: str, default: Any = None) -> Any:
-        """读取配置字段。"""
-        plugin_config = await self._get_plugin_config()
-        return _get_nested_config_value(plugin_config, key, default)
 
     @staticmethod
     def _normalize_task_model_list(raw_model_list: Any) -> list[str]:
@@ -1041,24 +1380,27 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             "conservative": "偏沉稳的发消息风格，一条消息说比较完整的内容，不会频繁发短消息。",
             "active": "活泼的发消息风格，喜欢发短消息连击，反应词和正文分开发。",
         }
+        normalized_style = style if style in style_guides else "natural"
 
-        return f"""你正在模拟一个人用手机聊天。下面是 ta 想说的内容，请把它分成几条消息，就像真人会怎么一条一条发出来那样。
+        return f"""按真人手机聊天节奏，把原文分成若干条消息。
 
-{style_guides.get(style, style_guides["natural"])}
+{style_guides[normalized_style]}
 
-规则：
-- 不要改写原意，不要补充新信息
-- 去掉每条消息末尾的句号「。」
-- 保留感叹号、问号、省略号、波浪号等有情绪的标点
-- 不要每个逗号都拆开，相关的内容放在一条里
-- 消息长短可以不均匀
-- 括号（中文「（）」「【】」或英文「()」「[]」）内的内容（动作、神态、旁白等描述）必须作为独立的一条消息单独发送，不要和括号外的正文合在同一条
-- 括号内的内容本身不能再拆开，需保持完整
-- 如果整段内容就是被括号包裹的动作/神态描述，直接整段返回不再切分
+要求：
+- 只在自然发送点切分；没有自然切点就保持一条，相关的内容放在一条里，消息长短可以不均匀
+- 原文没有标点时，存在明显的自然发送边界也要分条
+- 不要改写原意或补充内容；仅去掉各条末尾的句号「。」，保留问号、感叹号、省略号、波浪号
+- 括号内的动作、神态或旁白必须完整、独立成一条；整段只有括号内容时不切
 - 最多分成 {max_segments} 条
-- 如果不适合切分，就返回只包含原文的一项数组
 
-原文：{text}
+示例：
+原文："哈哈真的吗，那太好了！我还以为你不喜欢呢。下次我们一起去看电影吧，最近有个新片子挺有意思的。"
+分条：["哈哈真的吗", "那太好了！我还以为你不喜欢呢", "下次我们一起去看电影吧，最近有个新片子挺有意思的"]
+
+原文："你买早饭我到了要吃的"
+分条：["你买早饭", "我到了要吃的"]
+
+待分段原文：{text}
 
 只返回 JSON 数组，如 ["消息1", "消息2"]"""
 
@@ -1074,7 +1416,11 @@ class SmartSegmentationPlugin(MaiBotPlugin):
     ) -> list[str] | None:
         """调用 LLM 对文本进行分段。"""
         prompt = self._build_segmentation_prompt(text, style, max_segments)
-        target_kind, target_name = await self._resolve_generation_model(model_name)
+        try:
+            target_kind, target_name = await self._resolve_generation_model(model_name)
+        except Exception as exc:
+            logger.error("解析智能分段模型失败: %s", exc, exc_info=True)
+            return None
         logger.info(
             "智能分段开始调用 LLM: configured_model=%r resolved_kind=%r resolved_target=%r",
             model_name,
@@ -1105,6 +1451,9 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         result = raw_result
         if isinstance(raw_result, dict) and isinstance(raw_result.get("result"), dict):
             result = raw_result.get("result") or {}
+        if not isinstance(result, dict):
+            logger.error("智能分段 LLM 返回结构异常: %r", result)
+            return None
 
         if not result.get("success", False):
             logger.error("智能分段 LLM 返回失败: %s", result)
@@ -1128,7 +1477,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         try:
             json_text = _extract_json_array_text(response_text)
             segments = json.loads(json_text)
-            normalized = _normalize_segments(segments, max_segments=max_segments)
+            normalized = _normalize_segments(segments, max_segments=0)
             # 先合并被模型误拆的括号对，确保每段括号成对；再按括号边界把动作描述拆成独立段。
             balanced = _merge_segments_balancing_brackets(normalized)
             return _split_segments_at_bracket_boundaries(balanced, max_segments=max_segments)
@@ -1136,43 +1485,142 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             logger.error("解析智能分段结果失败: %s, 原始返回: %r", exc, response_text)
             return None
 
+    async def _segment_text_with_delayed_retry(
+        self,
+        text: str,
+        *,
+        style: str,
+        model_name: str,
+        max_segments: int,
+        temperature: float,
+        max_tokens: int,
+    ) -> list[str] | None:
+        """首个请求迟迟未返回时，并发重试同一个分段模型。"""
+
+        async def _start_attempt() -> list[str] | None:
+            return await self._segment_text(
+                text,
+                style=style,
+                model_name=model_name,
+                max_segments=max_segments,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        first_attempt = asyncio.create_task(_start_attempt())
+        all_attempts = [first_attempt]
+        active_attempts: set[asyncio.Task[list[str] | None]] = {first_attempt}
+        try:
+            done, _ = await asyncio.wait(
+                active_attempts,
+                timeout=_REPLYER_SEGMENT_RETRY_DELAY_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if done:
+                first_result = first_attempt.result()
+                if first_result is not None:
+                    return first_result
+                active_attempts.clear()
+                logger.warning("首次智能分段请求未返回有效结果，立即重试同一模型")
+            else:
+                logger.warning(
+                    "首次智能分段请求超过 %.2fs，开始并发重试同一模型",
+                    _REPLYER_SEGMENT_RETRY_DELAY_SECONDS,
+                )
+
+            retry_attempt = asyncio.create_task(_start_attempt())
+            all_attempts.append(retry_attempt)
+            active_attempts.add(retry_attempt)
+
+            while active_attempts:
+                completed, active_attempts = await asyncio.wait(
+                    active_attempts,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for attempt in completed:
+                    result = attempt.result()
+                    if result is not None:
+                        logger.info(
+                            "智能分段采用第 %s 次模型请求结果",
+                            1 if attempt is first_attempt else 2,
+                        )
+                        return result
+            return None
+        finally:
+            for attempt in all_attempts:
+                if not attempt.done():
+                    attempt.cancel()
+            await asyncio.gather(*all_attempts, return_exceptions=True)
+
     async def _send_segments(
         self,
         stream_id: str,
         segments: list[str],
         *,
-        sync_to_maisaka_history: bool = True,
+        typing_enabled: bool,
     ) -> bool:
-        """逐条同步发送分段结果（即发即同步，无段间 sleep）。"""
+        """逐条发送补充分段，段前等待完全复用 MaiBot 原生打字速度。"""
+        all_segments_sent = True
         for index, segment in enumerate(segments):
-            send_ok = await self.ctx.send.text(
-                segment,
-                stream_id,
-                sync_to_maisaka_history=sync_to_maisaka_history,
-                maisaka_source_kind="guided_reply",
-            )
-            if not send_ok:
-                logger.error("发送分段消息失败，第 %s 段: %r", index + 1, segment)
-                return False
+            segment_sent = False
+            for attempt in range(_FOLLOW_UP_SEND_MAX_ATTEMPTS):
+                try:
+                    send_ok = await self.ctx.send.text(
+                        segment,
+                        stream_id,
+                        typing=typing_enabled and attempt == 0,
+                        sync_to_maisaka_history=True,
+                        maisaka_source_kind="guided_reply",
+                        timeout_ms=_SEND_SEGMENT_RPC_TIMEOUT_MS,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    send_ok = False
+                    logger.warning(
+                        "发送分段消息异常，第 %s 段，第 %s/%s 次尝试: %s",
+                        index + 1,
+                        attempt + 1,
+                        _FOLLOW_UP_SEND_MAX_ATTEMPTS,
+                        exc,
+                        exc_info=True,
+                    )
+                if send_ok:
+                    segment_sent = True
+                    break
+                logger.warning(
+                    "发送分段消息失败，第 %s 段，第 %s/%s 次尝试: %r",
+                    index + 1,
+                    attempt + 1,
+                    _FOLLOW_UP_SEND_MAX_ATTEMPTS,
+                    segment,
+                )
 
-        return True
+            if not segment_sent:
+                all_segments_sent = False
+                logger.error("分段消息重试仍失败，继续发送后续正文，第 %s 段: %r", index + 1, segment)
+
+        return all_segments_sent
 
     async def _get_segmentation_runtime_settings(self) -> dict[str, Any] | None:
         """读取并规范化运行时所需的分段配置。"""
-        plugin_enabled = bool(await self._get_config_value("plugin.enabled", True))
-        segmentation_enabled = bool(await self._get_config_value("segmentation.enabled", True))
+        plugin_config = await self._get_plugin_config()
+        plugin_enabled = bool(_get_nested_config_value(plugin_config, "plugin.enabled", True))
+        segmentation_enabled = bool(_get_nested_config_value(plugin_config, "segmentation.enabled", True))
         if not plugin_enabled or not segmentation_enabled or not _runtime_enabled:
             return None
 
-        min_length_raw = await self._get_config_value("segmentation.min_length", 15)
-        max_segments_raw = await self._get_config_value("segmentation.max_segments", 8)
-        temperature_raw = await self._get_config_value("segmentation.temperature", 0.3)
-        max_tokens_raw = await self._get_config_value("segmentation.max_tokens", 600)
-        style = str(await self._get_config_value("segmentation.style", "natural") or "natural")
-        model_name = str(await self._get_config_value("segmentation.model", "") or "")
-        delay_base_raw = await self._get_config_value("segmentation.delay_base", 0.35)
-        delay_per_char_raw = await self._get_config_value("segmentation.delay_per_char", 0.015)
-        delay_max_raw = await self._get_config_value("segmentation.delay_max", 1.2)
+        min_length_raw = _get_nested_config_value(plugin_config, "segmentation.min_length", 15)
+        max_segments_raw = _get_nested_config_value(
+            plugin_config,
+            "segmentation.max_segments",
+            _DEFAULT_MAX_SEGMENTS,
+        )
+        temperature_raw = _get_nested_config_value(plugin_config, "segmentation.temperature", 0.3)
+        max_tokens_raw = _get_nested_config_value(plugin_config, "segmentation.max_tokens", 600)
+        style = str(_get_nested_config_value(plugin_config, "segmentation.style", "natural") or "natural")
+        model_name = str(_get_nested_config_value(plugin_config, "segmentation.model", "") or "")
+        typing_enabled = bool(_get_nested_config_value(plugin_config, "segmentation.typing_enabled", True))
 
         try:
             min_length = int(min_length_raw)
@@ -1181,7 +1629,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         try:
             max_segments = max(1, int(max_segments_raw))
         except (TypeError, ValueError):
-            max_segments = 8
+            max_segments = _DEFAULT_MAX_SEGMENTS
         try:
             temperature = float(temperature_raw)
         except (TypeError, ValueError):
@@ -1190,19 +1638,6 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             max_tokens = int(max_tokens_raw)
         except (TypeError, ValueError):
             max_tokens = 600
-        try:
-            delay_base = float(delay_base_raw)
-        except (TypeError, ValueError):
-            delay_base = 0.35
-        try:
-            delay_per_char = float(delay_per_char_raw)
-        except (TypeError, ValueError):
-            delay_per_char = 0.015
-        try:
-            delay_max = float(delay_max_raw)
-        except (TypeError, ValueError):
-            delay_max = 1.2
-
         return {
             "min_length": min_length,
             "max_segments": max_segments,
@@ -1210,15 +1645,14 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             "max_tokens": max_tokens,
             "style": style,
             "model_name": model_name,
-            "delay_base": delay_base,
-            "delay_per_char": delay_per_char,
-            "delay_max": delay_max,
+            "typing_enabled": typing_enabled,
         }
 
     @HookHandler(
         "maisaka.replyer.after_response",
         name="smart_segmentation_after_replyer_response",
         description="在 Maisaka replyer 拿到模型回复后立刻预分段，把结果登记到进程内缓存，发送链可零 LLM 调用直接消费",
+        timeout_ms=_REPLYER_HOOK_TIMEOUT_MS,
     )
     async def handle_maisaka_replyer_after_response(
         self,
@@ -1259,7 +1693,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
 
         try:
             segments = await asyncio.wait_for(
-                self._segment_text(
+                self._segment_text_with_delayed_retry(
                     visible_text,
                     style=settings["style"],
                     model_name=settings["model_name"],
@@ -1271,7 +1705,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "智能分段在 replyer.after_response 阶段超时（> %.2fs），发送前还会再尝试一次",
+                "智能分段在 replyer.after_response 阶段超时（> %.2fs），将回退为原文直发",
                 _REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS,
             )
             return {"action": "continue"}
@@ -1286,6 +1720,107 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                 len(segments),
                 normalized_stream_id,
             )
+        return {"action": "continue"}
+
+    @HookHandler(
+        "maisaka.reply.before_post_process",
+        name="smart_segmentation_preserve_prepared_response",
+        description="预分段成功后跳过宿主文本改写，保证发送链能按原文哈希命中缓存",
+    )
+    async def handle_maisaka_reply_before_post_process(
+        self,
+        response: str = "",
+        session_id: str = "",
+        reply_message_id: str = "",
+        reply_tool_args: dict[str, Any] | None = None,
+        skip_post_process: bool = False,
+        enable_splitter: bool = True,
+        enable_chinese_typo: bool = True,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """只在精确命中预分段缓存时关闭本次宿主文本后处理。"""
+        if not _has_prepared_segments(session_id, response):
+            return {"action": "continue"}
+        modified_kwargs = dict(kwargs)
+        modified_kwargs.update(
+            {
+                "response": response,
+                "session_id": session_id,
+                "reply_message_id": reply_message_id,
+                "reply_tool_args": dict(reply_tool_args or {}),
+                "skip_post_process": True,
+                "enable_splitter": bool(enable_splitter),
+                "enable_chinese_typo": bool(enable_chinese_typo),
+            }
+        )
+        return {
+            "action": "continue",
+            "modified_kwargs": modified_kwargs,
+        }
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="smart_segmentation_wait_before_planner",
+        description="等待同流分段全部发送并同步历史，再修补可能提前构建的 planner prompt",
+        mode=HookMode.BLOCKING,
+        timeout_ms=_FOLLOW_UP_WAIT_TIMEOUT_MS,
+    )
+    async def handle_maisaka_planner_before_request(
+        self,
+        messages: list[Any] | None = None,
+        tool_definitions: list[Any] | None = None,
+        selected_history_count: int = 0,
+        built_message_count: int = 0,
+        selection_reason: str = "",
+        session_id: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """关闭补发与同一次 reply 内部 planner 续轮之间的竞态窗口。"""
+        entries = _pop_planner_follow_up_entries(session_id)
+        if not entries:
+            return {"action": "continue"}
+
+        await asyncio.gather(
+            *(
+                _wait_for_planner_follow_up_entry(entry, stream_id=session_id)
+                for entry in entries
+            )
+        )
+
+        modified_kwargs = dict(kwargs)
+        modified_kwargs.update(
+            {
+                "messages": _repair_planner_messages(list(messages or []), entries),
+                "tool_definitions": list(tool_definitions or []),
+                "selected_history_count": selected_history_count,
+                "built_message_count": built_message_count,
+                "selection_reason": selection_reason,
+                "session_id": session_id,
+            }
+        )
+        return {"action": "continue", "modified_kwargs": modified_kwargs}
+
+    @HookHandler(
+        "chat.receive.before_process",
+        name="smart_segmentation_pause_until_follow_ups_finish",
+        description="同一聊天流仍在模拟打字补发时，延后处理下一条入站消息",
+        mode=HookMode.BLOCKING,
+        timeout_ms=_FOLLOW_UP_WAIT_TIMEOUT_MS,
+    )
+    async def handle_chat_receive_before_process(
+        self,
+        message: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """避免用户的新消息与尚未发完的旧回复交错。"""
+        del kwargs
+        if not isinstance(message, dict):
+            return {"action": "continue"}
+
+        stream_id = str(message.get("session_id", "") or "").strip()
+        waited_task_count = await _wait_for_stream_follow_up_tasks(stream_id)
+        if waited_task_count > 0:
+            logger.info("智能分段已等待聊天流 %s 的 %s 个补发任务结束", stream_id, waited_task_count)
         return {"action": "continue"}
 
     @HookHandler(
@@ -1370,6 +1905,13 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         outbound_text = _strip_thinking_content(_extract_plain_text_outbound_message(message, outbound_text_hint))
 
         cached_segments = _pop_prepared_segments(normalized_stream_id, outbound_text)
+        if not cached_segments:
+            mention_body = _extract_leading_mentions_and_text_body(message)
+            if mention_body is not None:
+                mention_prefix, text_body = mention_body
+                cached_segments = _pop_prepared_segments(normalized_stream_id, text_body)
+                if cached_segments:
+                    cached_segments[0] = f"{mention_prefix}{cached_segments[0]}"
         if not cached_segments or len(cached_segments) <= 1:
             return {"action": "continue"}
 
@@ -1399,9 +1941,11 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             pending_data={
                 "stream_id": normalized_stream_id,
                 "segments": follow_up_segments,
-                "delay_base": settings["delay_base"],
-                "delay_per_char": settings["delay_per_char"],
-                "delay_max": settings["delay_max"],
+                "typing_enabled": settings["typing_enabled"],
+                "planner_entry": _register_planner_follow_up_entry(
+                    stream_id=normalized_stream_id,
+                    segments=segments,
+                ),
             },
         )
         logger.info(
@@ -1414,9 +1958,8 @@ class SmartSegmentationPlugin(MaiBotPlugin):
     @HookHandler(
         "send_service.after_send",
         name="smart_segmentation_after_send",
-        description="在首段发送成功后于同一阻塞窗口内同步补发剩余智能分段消息",
-        mode=HookMode.BLOCKING,
-        timeout_ms=_AFTER_SEND_FOLLOW_UP_TIMEOUT_MS,
+        description="首段发送成功后启动后台补发，planner 请求会等待补发完成",
+        mode=HookMode.OBSERVE,
     )
     async def handle_smart_segmentation_after_send(
         self,
@@ -1424,11 +1967,9 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         sent: bool = False,
         **kwargs: Any,
     ) -> None:
-        """BLOCKING：在同一阻塞窗口内同步补发剩余分段，reply 工具返回前 N 段已全部落历史。"""
+        """快速登记后台补发；实际发送不占用宿主 after_send 的超时窗口。"""
         del kwargs
         if not isinstance(message, dict):
-            return None
-        if not sent:
             return None
         message_id = str(message.get("message_id", "") or "").strip()
         normalized_stream_id = str(message.get("session_id", "") or "").strip()
@@ -1448,15 +1989,27 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         pending_data = _resolve_pending_follow_up_segments(message_id=message_id, tracking_key=tracking_key)
         if pending_data is None:
             return None
+        planner_entry = pending_data.get("planner_entry")
+        _mark_planner_follow_up_started(planner_entry)
+        if not sent:
+            _complete_planner_follow_up_entry(planner_entry, send_ok=False)
+            return None
         stream_id = str(pending_data.get("stream_id", "") or message.get("session_id", "") or "").strip()
         segments = pending_data.get("segments")
-        if not stream_id or not isinstance(segments, list) or not segments:
+        typing_enabled = pending_data.get("typing_enabled")
+        if not stream_id or not isinstance(segments, list) or not segments or not isinstance(typing_enabled, bool):
+            _complete_planner_follow_up_entry(planner_entry, send_ok=False)
             return None
-        await self._run_follow_up_segments(
-            stream_id=stream_id,
-            segments=list(segments),
-            message_id=message_id,
+        follow_up_task = asyncio.create_task(
+            self._run_follow_up_segments(
+                stream_id=stream_id,
+                segments=list(segments),
+                message_id=message_id,
+                typing_enabled=typing_enabled,
+                planner_entry=planner_entry,
+            )
         )
+        _track_follow_up_task(follow_up_task, stream_id=stream_id)
         return None
 
     async def _run_follow_up_segments(
@@ -1465,15 +2018,19 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         stream_id: str,
         segments: list[str],
         message_id: str,
-        sync_to_maisaka_history: bool = True,
+        typing_enabled: bool,
+        planner_entry: Any = None,
     ) -> None:
-        """在 after_send 的阻塞窗口内同步补发剩余分段，并兜住异常防止泄漏。"""
+        """在后台顺序补发剩余分段，并在任务边界记录异常。"""
+        send_ok = False
         try:
+            # 先让 after_send 响应有机会回到宿主；启用时由宿主模拟打字承担可见等待。
+            await asyncio.sleep(0)
             with _guard_stream_resend(stream_id):
                 send_ok = await self._send_segments(
                     stream_id,
                     segments,
-                    sync_to_maisaka_history=sync_to_maisaka_history,
+                    typing_enabled=typing_enabled,
                 )
         except asyncio.CancelledError:
             logger.warning(
@@ -1487,9 +2044,10 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                 stream_id, message_id, exc, exc_info=True,
             )
             return
+        finally:
+            _complete_planner_follow_up_entry(planner_entry, send_ok=send_ok)
         if not send_ok:
             logger.error("智能分段补发失败，stream_id=%s message_id=%s", stream_id, message_id)
-            return
 
     @Command("smart_seg", description="开关智能分段功能", pattern=r"^/smart_seg(?:\s+(?P<action>on|off|status))?\s*$")
     async def handle_smart_seg(
@@ -1523,8 +2081,9 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             return True, "智能分段已关闭", True
 
         if action == "status":
-            plugin_enabled = bool(await self._get_config_value("plugin.enabled", True))
-            segmentation_enabled = bool(await self._get_config_value("segmentation.enabled", True))
+            plugin_config = await self._get_plugin_config()
+            plugin_enabled = bool(_get_nested_config_value(plugin_config, "plugin.enabled", True))
+            segmentation_enabled = bool(_get_nested_config_value(plugin_config, "segmentation.enabled", True))
             state = "开启" if _runtime_enabled else "关闭"
             config_state = "启用" if plugin_enabled and segmentation_enabled else "禁用"
             await self.ctx.send.text(f"智能分段当前状态: {state}，配置状态: {config_state}", stream_id)
