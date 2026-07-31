@@ -38,7 +38,7 @@ enable = false
 
 ```toml
 [plugin]
-config_version = "1.1.0"
+config_version = "1.2.0"
 version = "1.1.0"
 enabled = true
 

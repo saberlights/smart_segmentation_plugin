@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, ClassVar
 
 import asyncio
 import hashlib
@@ -134,30 +134,75 @@ class _PinnedTaskLLMOrchestrator(LLMOrchestrator):
 class PluginSectionConfig(PluginConfigBase):
     """插件基础配置。"""
 
-    name: str = Field(default="smart_segmentation_plugin", description="插件名称")
-    config_version: str = Field(default="1.1.0", description="配置文件版本")
-    version: str = Field(default="1.1.0", description="插件版本")
-    enabled: bool = Field(default=True, description="是否启用插件")
+    __ui_label__: ClassVar[str] = "基础设置"
+    __ui_order__: ClassVar[int] = 0
+
+    name: str = Field(
+        default="smart_segmentation_plugin",
+        description="插件内部名称；保持默认值即可",
+    )
+    config_version: str = Field(
+        default="1.2.0",
+        description="配置文件版本；保持默认值即可",
+    )
+    version: str = Field(
+        default="1.1.0",
+        description="插件版本；保持默认值即可",
+    )
+    enabled: bool = Field(
+        default=True,
+        description="是否启用插件；true 开启，false 关闭",
+    )
 
 
 class SegmentationSectionConfig(PluginConfigBase):
     """智能分段配置。"""
 
-    enabled: bool = Field(default=True, description="是否启用智能分段")
-    model: str = Field(default="", description="分段使用的模型名称，留空则使用宿主默认模型")
-    style: str = Field(default="natural", description="分段风格：natural / conservative / active")
-    min_length: int = Field(default=15, description="启用分段的最小文本长度")
-    max_segments: int = Field(default=8, description="最大分段数量")
-    temperature: float = Field(default=0.3, description="分段模型温度")
-    max_tokens: int = Field(default=600, description="分段模型最大输出 token")
-    typing_enabled: bool = Field(default=True, description="是否为后续分段启用宿主模拟打字等待")
+    __ui_label__: ClassVar[str] = "智能分段"
+    __ui_order__: ClassVar[int] = 1
+
+    enabled: bool = Field(
+        default=True,
+        description="是否启用智能分段；true 开启，false 关闭",
+    )
+    model: str = Field(
+        default="",
+        description="分段使用的模型；填写任务名、模型名或模型标识，留空使用默认模型",
+    )
+    style: str = Field(
+        default="natural",
+        description="分段风格；填写 natural（自然）、conservative（少分段）或 active（多分段）",
+    )
+    min_length: int = Field(
+        default=15,
+        description="触发分段的最小回复长度；填写正整数，短于此长度的回复不分段",
+    )
+    max_segments: int = Field(
+        default=8,
+        description="单次回复的最大分段数；填写正整数",
+    )
+    temperature: float = Field(
+        default=0.3,
+        description="分段模型温度；填写 0.1 至 0.5，推荐 0.3",
+    )
+    max_tokens: int = Field(
+        default=600,
+        description="分段模型最大输出 token 数；填写正整数，推荐 600",
+    )
+    typing_enabled: bool = Field(
+        default=True,
+        description="是否模拟打字等待；true 开启，false 关闭",
+    )
 
 
 class SmartSegmentationConfig(PluginConfigBase):
     """插件完整配置。"""
 
-    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
-    segmentation: SegmentationSectionConfig = Field(default_factory=SegmentationSectionConfig)
+    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig, description="插件基础设置")
+    segmentation: SegmentationSectionConfig = Field(
+        default_factory=SegmentationSectionConfig,
+        description="智能分段设置",
+    )
 
 
 def _merge_config_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -1203,6 +1248,30 @@ class SmartSegmentationPlugin(MaiBotPlugin):
     """使用 LLM 对主回复进行智能分段，并直接分条发送。"""
 
     config_model = SmartSegmentationConfig
+
+    def get_webui_config_schema(
+        self,
+        *,
+        plugin_id: str = "",
+        plugin_name: str = "",
+        plugin_version: str = "",
+        plugin_description: str = "",
+        plugin_author: str = "",
+    ) -> dict[str, Any]:
+        """返回带字段帮助文案的 WebUI 配置 Schema。"""
+        schema = super().get_webui_config_schema(
+            plugin_id=plugin_id,
+            plugin_name=plugin_name,
+            plugin_version=plugin_version,
+            plugin_description=plugin_description,
+            plugin_author=plugin_author,
+        )
+        for section in schema.get("sections", {}).values():
+            for field_name, field_schema in section.get("fields", {}).items():
+                description = str(field_schema.get("description") or "").strip()
+                field_schema["label"] = description.split("；", 1)[0].strip() or field_name
+                field_schema["hint"] = description
+        return schema
 
     def get_components(self) -> list[dict[str, Any]]:
         """补充当前 SDK 未导出的 hook_handler 声明。"""

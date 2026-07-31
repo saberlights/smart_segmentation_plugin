@@ -1,55 +1,48 @@
-# smart_segmentation_plugin - 智能分段插件配置文件
-# 使用 LLM 智能切分回复文本
+# 智能分段插件配置
+# 使用分段模型把一条回复拆成多条连续消息
 
-# ⚠️ 重要：必须禁用 MaiBot 内置分段功能！
-# 在 config/bot_config.toml 中设置：
+# 使用前必须在 config/bot_config.toml 中关闭 MaiBot 内置分段：
 # [response_splitter]
 # enable = false
 
-# 插件基本信息
+# 基础设置
 [plugin]
 
-# 插件名称
+# 插件内部名称；保持默认值即可
 name = "smart_segmentation_plugin"
 
-# 配置文件版本
-config_version = "1.1.0"
+# 配置文件版本；保持默认值即可
+config_version = "1.2.0"
 
-# 插件版本
+# 插件版本；保持默认值即可
 version = "1.1.0"
 
-# 是否启用插件
+# 是否启用插件；true 开启，false 关闭
 enabled = true
 
-# 智能分段配置
-
+# 智能分段设置
 [segmentation]
 
-# 是否启用智能分段
+# 是否启用智能分段；true 开启，false 关闭
 enabled = true
 
-# 使用的模型名称。可填写 task 名（如 utils），也可直接填写
-# 宿主 model_config.toml 里的具体模型名（[[models]].name）
-# 或模型标识（[[models]].model_identifier）
-# 留空时插件会优先回退到 utils
+# 分段使用的模型；填写任务名、模型名或模型标识，留空使用默认模型
 model = "doubao1.6"
 
-# 切分风格
-# - natural: 自然风格，在自然停顿处切分（推荐）
-# - conservative: 保守风格，尽量少切分
-# - active: 活跃风格，切分更细致
+# 分段风格；填写 natural（自然）、conservative（少分段）或 active（多分段）
 style = "natural"
 
-# 启用分段的最小文本长度（字符数）
-# 小于此长度的文本不会切分
+# 触发分段的最小回复长度；填写正整数，短于此长度的回复不分段
 min_length = 3
 
-# 最大切分段数
-# 避免长文切分过多导致刷屏；可按需要自定义
+# 单次回复的最大分段数；填写正整数
 max_segments = 16
 
-# 是否为后续分段启用宿主模拟打字等待
-typing_enabled = true
+# 分段模型温度；填写 0.1 至 0.5，推荐 0.3
+temperature = 0.3
 
-# 开启后，等待速度复用宿主 config/bot_config.toml 中的
-# response_post_process.typing_speed；旧版 delay_* 配置键已被忽略
+# 分段模型最大输出 token 数；填写正整数，推荐 600
+max_tokens = 600
+
+# 是否模拟打字等待；true 开启，false 关闭
+typing_enabled = true

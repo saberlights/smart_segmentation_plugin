@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from plugins.smart_segmentation_plugin import plugin as plugin_module
 from plugins.smart_segmentation_plugin.plugin import (
     _COMMAND_REPLY_GRACE_SECONDS,
+    PluginSectionConfig,
+    SegmentationSectionConfig,
     SmartSegmentationPlugin,
     _extract_json_array_text,
     _extract_plain_text_outbound_message,
@@ -42,6 +44,56 @@ def _reset_global_state() -> None:
     plugin_module._active_follow_up_tasks_by_stream.clear()
     plugin_module._follow_up_idle_events_by_stream.clear()
     plugin_module._planner_follow_up_entries_by_stream.clear()
+
+
+def test_config_schema_uses_user_facing_webui_copy() -> None:
+    assert PluginSectionConfig.__ui_label__ == "基础设置"
+    assert SegmentationSectionConfig.__ui_label__ == "智能分段"
+
+    plugin_fields = PluginSectionConfig.model_fields
+    segmentation_fields = SegmentationSectionConfig.model_fields
+    assert plugin_fields["config_version"].default == "1.2.0"
+    assert "保持默认值" in plugin_fields["name"].description
+    assert "true 开启，false 关闭" in plugin_fields["enabled"].description
+    assert "留空使用默认模型" in segmentation_fields["model"].description
+    assert "填写正整数" in segmentation_fields["min_length"].description
+    assert "填写正整数" in segmentation_fields["max_segments"].description
+    assert "true 开启，false 关闭" in segmentation_fields["typing_enabled"].description
+
+
+def test_webui_hints_match_config_toml_comments() -> None:
+    config_path = Path(plugin_module.__file__).with_name("config.toml")
+    comments: dict[tuple[str, str], str] = {}
+    section = ""
+    pending_comment = ""
+
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith("# "):
+            pending_comment = line[2:]
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            pending_comment = ""
+            continue
+        if section and pending_comment and "=" in line:
+            field_name = line.split("=", 1)[0].strip()
+            comments[(section, field_name)] = pending_comment
+        if line:
+            pending_comment = ""
+
+    schema = SmartSegmentationPlugin().get_webui_config_schema(
+        plugin_id="saberlights.smart-segmentation-plugin"
+    )
+    schema_fields = {
+        (section_name, field_name): field
+        for section_name, section_schema in schema["sections"].items()
+        for field_name, field in section_schema["fields"].items()
+    }
+
+    assert set(schema_fields) == set(comments)
+    for field_path, comment in comments.items():
+        assert schema_fields[field_path]["hint"] == comment
 
 
 def test_get_components_registers_hook_handlers_for_current_host() -> None:
