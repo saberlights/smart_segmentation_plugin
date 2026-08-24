@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from src.llm_models.payload_content.context_item import ContextItemBuilder, RoleType
+from src.plugin_runtime.hook_payloads import deserialize_prompt_items, serialize_prompt_items
+
 from plugins.smart_segmentation_plugin import plugin as plugin_module
 from plugins.smart_segmentation_plugin.plugin import (
     _COMMAND_REPLY_GRACE_SECONDS,
@@ -741,18 +744,18 @@ def test_planner_before_request_waits_for_follow_ups_and_repairs_built_prompt() 
                 processed_plain_text=response_text,
             )
             first_message = build_result["modified_kwargs"]["message"]
-            planner_messages = [
-                {"role": "tool", "content": "工具结果声称三段均已发送"},
-                {
-                    "role": "user",
-                    "content": '<message msg_id="first" user="bot" is_self_message="true">\n行啊',
-                },
-                {"role": "user", "content": "时间：2026-07-26 23:45:52"},
-            ]
+            planner_source_items = (
+                ContextItemBuilder()
+                .set_role(RoleType.User)
+                .add_text_content('<message msg_id="first" user="bot" is_self_message="true">\n行啊')
+                .build(),
+                ContextItemBuilder().set_role(RoleType.User).add_text_content("时间：2026-07-26 23:45:52").build(),
+            )
+            planner_messages = serialize_prompt_items(planner_source_items)
 
             planner_task = asyncio.create_task(
                 plugin.handle_maisaka_planner_before_request(
-                    messages=planner_messages,
+                    items=planner_messages,
                     tool_definitions=[{"type": "function"}],
                     selected_history_count=2,
                     built_message_count=3,
@@ -771,7 +774,9 @@ def test_planner_before_request_waits_for_follow_ups_and_repairs_built_prompt() 
             planner_result = await asyncio.wait_for(planner_task, timeout=0.2)
 
         modified = planner_result["modified_kwargs"]
-        assert modified["messages"][1]["content"].endswith("\n" + "\n".join(segments))
+        assert modified["items"][0]["parts"][0]["text"].endswith("\n" + "\n".join(segments))
+        restored_items = deserialize_prompt_items(modified["items"], original_items=planner_source_items)
+        assert restored_items[0].parts[0].text.endswith("\n" + "\n".join(segments))
         assert modified["tool_definitions"] == [{"type": "function"}]
         assert modified["selected_history_count"] == 2
         assert modified["built_message_count"] == 3
@@ -831,7 +836,7 @@ def test_planner_releases_quickly_when_first_send_never_reaches_after_send() -> 
         ):
             result = await asyncio.wait_for(
                 plugin.handle_maisaka_planner_before_request(
-                    messages=[],
+                    items=[],
                     session_id="stream-first-send-failed",
                 ),
                 timeout=0.1,

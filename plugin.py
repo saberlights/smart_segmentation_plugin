@@ -979,9 +979,32 @@ def _planner_message_body(content: str) -> str:
     return ""
 
 
-def _repair_planner_messages(messages: list[Any], entries: list[dict[str, Any]]) -> list[Any]:
-    """把 prompt 中仅可见首段的自身消息替换为本次完整分段文本。"""
-    repaired_messages = [dict(message) if isinstance(message, dict) else message for message in messages]
+def _planner_user_text_part(item: dict[str, Any]) -> tuple[int, str] | None:
+    """返回 UserMessageItem 中的文本 part，供 prompt 修补使用。"""
+    if item.get("item_type") != "UserMessageItem":
+        return None
+    parts = item.get("parts")
+    if not isinstance(parts, list):
+        return None
+    for index, part in enumerate(parts):
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+            return index, part["text"]
+    return None
+
+
+def _repair_planner_messages(items: list[Any], entries: list[dict[str, Any]]) -> list[Any]:
+    """把 prompt 中仅可见首段的 UserMessageItem 修补为完整分段文本。"""
+    repaired_items: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict):
+            repaired_items.append(item)
+            continue
+        cloned_item = dict(item)
+        raw_parts = item.get("parts")
+        if isinstance(raw_parts, list):
+            cloned_item["parts"] = [dict(part) if isinstance(part, dict) else part for part in raw_parts]
+        repaired_items.append(cloned_item)
+
     for entry in entries:
         segments = entry.get("segments")
         if not entry.get("send_ok") or not isinstance(segments, list) or len(segments) <= 1:
@@ -989,12 +1012,12 @@ def _repair_planner_messages(messages: list[Any], entries: list[dict[str, Any]])
         normalized_segments = [str(segment) for segment in segments]
         first_segment = normalized_segments[0]
         candidate_index = -1
-        for index in range(len(repaired_messages) - 1, -1, -1):
-            message = repaired_messages[index]
-            if not isinstance(message, dict) or message.get("role") != "user":
+        for index in range(len(repaired_items) - 1, -1, -1):
+            message = repaired_items[index]
+            if not isinstance(message, dict):
                 continue
-            content = message.get("content")
-            if isinstance(content, str) and _planner_message_body(content) == first_segment:
+            text_part = _planner_user_text_part(message)
+            if text_part is not None and _planner_message_body(text_part[1]) == first_segment:
                 candidate_index = index
                 break
         if candidate_index < 0:
@@ -1003,13 +1026,13 @@ def _repair_planner_messages(messages: list[Any], entries: list[dict[str, Any]])
         matched_tail_indices: list[int] = []
         next_index = candidate_index + 1
         for tail_segment in normalized_segments[1:]:
-            if next_index >= len(repaired_messages):
+            if next_index >= len(repaired_items):
                 break
-            next_message = repaired_messages[next_index]
-            if not isinstance(next_message, dict) or next_message.get("role") != "user":
+            next_message = repaired_items[next_index]
+            if not isinstance(next_message, dict):
                 break
-            next_content = next_message.get("content")
-            if not isinstance(next_content, str) or _planner_message_body(next_content) != tail_segment:
+            next_text_part = _planner_user_text_part(next_message)
+            if next_text_part is None or _planner_message_body(next_text_part[1]) != tail_segment:
                 break
             matched_tail_indices.append(next_index)
             next_index += 1
@@ -1017,14 +1040,22 @@ def _repair_planner_messages(messages: list[Any], entries: list[dict[str, Any]])
         if len(matched_tail_indices) == len(normalized_segments) - 1:
             continue
 
-        candidate = repaired_messages[candidate_index]
-        original_content = str(candidate.get("content") or "")
+        candidate = repaired_items[candidate_index]
+        if not isinstance(candidate, dict):
+            continue
+        candidate_text_part = _planner_user_text_part(candidate)
+        if candidate_text_part is None:
+            continue
+        part_index, original_content = candidate_text_part
+        parts = candidate.get("parts")
+        if not isinstance(parts, list) or not isinstance(parts[part_index], dict):
+            continue
         header = original_content.split("\n", 1)[0]
         joined_segments = "\n".join(normalized_segments)
-        candidate["content"] = f"{header}\n{joined_segments}"
+        parts[part_index]["text"] = f"{header}\n{joined_segments}"
         for index in reversed(matched_tail_indices):
-            repaired_messages.pop(index)
-    return repaired_messages
+            repaired_items.pop(index)
+    return repaired_items
 
 
 # === 后台补发任务 ===
@@ -1876,7 +1907,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
     )
     async def handle_maisaka_planner_before_request(
         self,
-        messages: list[Any] | None = None,
+        items: list[Any] | None = None,
         tool_definitions: list[Any] | None = None,
         selected_history_count: int = 0,
         built_message_count: int = 0,
@@ -1899,7 +1930,7 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         modified_kwargs = dict(kwargs)
         modified_kwargs.update(
             {
-                "messages": _repair_planner_messages(list(messages or []), entries),
+                "items": _repair_planner_messages(list(items or []), entries),
                 "tool_definitions": list(tool_definitions or []),
                 "selected_history_count": selected_history_count,
                 "built_message_count": built_message_count,
